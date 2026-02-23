@@ -1,0 +1,124 @@
+[general]
+rpc_bind = "0.0.0.0:8899"
+ws_bind = "0.0.0.0:8900"
+grpc_bind = "0.0.0.0:10101"
+arpc_bind = "0.0.0.0:20202"
+dashboard_bind = "0.0.0.0:9000"
+dashboard_user = "admin"
+dashboard_pass = "changeme"
+data_dir = "/var/lib/solana-rpc-cluster"
+log_level = "info"
+
+[health]
+check_interval_secs = 5
+unhealthy_threshold = 3
+healthy_threshold = 2
+timeout_ms = 3000
+
+[routing]
+send_tx_targets = "all"
+grpc_regions = ["frankfurt", "amsterdam"]
+
+# ─── Cluster Nodes ───────────────────────────────────────────
+
+[[nodes]]
+id = "frankfurt"
+label = "Frankfurt (Primary)"
+region = "eu-west"
+priority = 1
+rpc_url = "http://fra.example.com:8899"
+ws_url = "ws://fra.example.com:8900"
+grpc_url = "http://fra.example.com:10101"
+arpc_url = "http://arpc.fra.example.com:20202"
+grpc_x_token = "your-x-token-here"
+# iris_url = "http://10.0.1.5:7000"
+
+[[nodes]]
+id = "amsterdam"
+label = "Amsterdam"
+region = "eu-west"
+priority = 2
+rpc_url = "http://ams.example.com:8899"
+ws_url = "ws://ams.example.com:8900"
+grpc_url = "http://ams.example.com:10101"
+arpc_url = "http://arpc.ams.example.com:20202"
+grpc_x_token = "your-x-token-here"
+# iris_url = "http://10.0.2.5:7000"
+
+[[nodes]]
+id = "tokyo"
+label = "Tokyo"
+region = "asia"
+priority = 10
+rpc_url = "http://tyo.example.com:8899"
+ws_url = "ws://tyo.example.com:8900"
+grpc_url = "http://tyo.example.com:10101"
+arpc_url = "http://arpc.tyo.example.com:20202"
+grpc_x_token = "your-x-token-here"
+# iris_url = "http://10.0.3.5:7000"
+
+[[nodes]]
+id = "newyork"
+label = "New York"
+region = "us-east"
+priority = 10
+rpc_url = "http://nyc.example.com:8899"
+ws_url = "ws://nyc.example.com:8900"
+grpc_url = "http://nyc.example.com:10101"
+arpc_url = "http://arpc.nyc.example.com:20202"
+grpc_x_token = "your-x-token-here"
+# iris_url = "http://10.0.4.5:7000"
+
+# ─── Rate Limits ─────────────────────────────────────────────
+
+[rate_limits]
+global_rps = 1250
+global_tps = 250
+default_rps = 200
+default_tps = 50
+default_burst_rps = 20
+default_burst_tps = 5
+
+# ─── IP Whitelist ────────────────────────────────────────────
+
+# [[whitelist]]
+# ip = "1.2.3.4"
+# label = "my-vps"
+# rps = 300
+# tps = 100
+
+# ─── API Keys ───────────────────────────────────────────────
+# Generated via dashboard, but can also be added manually:
+#
+# [[api_keys]]
+# key = "sk_0123456789abcdef0123456789abcdef"
+# label = "my-app"
+# revoked = false
+
+# ─── gRPC Tuning (optional) ─────────────────────────────────
+
+# [grpc]
+# connection_window_bytes = 16777216   # 16 MB
+# stream_window_bytes = 4194304        # 4 MB
+# adaptive_window = true
+# concurrency_limit = 256
+# broadcast_capacity = 65536
+# client_channel_capacity = 4096
+# max_lag_events = 3
+# keepalive_interval_secs = 20
+# keepalive_timeout_secs = 10
+# multi_region_enabled = true          # stream from all gRPC regions in parallel
+# dedup_window_secs = 30               # how long to remember messages for dedup
+# dedup_eviction_interval_secs = 5
+
+# ─── CPU Pinning (optional) ─────────────────────────────────
+
+[cpu]
+cores = []
+
+# ─── Firewall (optional) ────────────────────────────────────
+
+[firewall]
+enabled = false
+backend = "nftables"
+chain_name = "solana-rpc-cluster"

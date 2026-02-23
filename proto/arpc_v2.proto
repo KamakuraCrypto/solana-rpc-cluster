@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+package arpc.v2;
+
+import "google/protobuf/timestamp.proto";
+
+service ARPCServiceV2 {
+  rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream SubscribeEntriesResponse) {}
+  rpc SubscribeTransactions(stream SubscribeTransactionsRequest) returns (stream SubscribeTransactionsResponse) {}
+  rpc SubscribeSlots(SubscribeSlotsRequest) returns (stream SubscribeSlotsResponse) {}
+}
+
+// Entries
+
+message SubscribeEntriesRequest {
+  bool include_metadata = 1;
+  bool heartbeat = 2;
+}
+
+message SubscribeEntriesResponse {
+  oneof update {
+    EntryBatch entry_batch = 1;
+    Heartbeat heartbeat = 2;
+  }
+}
+
+message EntryBatch {
+  uint64 slot = 1;
+  uint64 tick = 2;
+  repeated Entry entries = 3;
+}
+
+message Entry {
+  uint64 num_hashes = 1;
+  bytes hash = 2;
+  uint64 num_transactions = 3;
+}
+
+// Transactions
+
+message SubscribeTransactionsRequest {
+  oneof request {
+    TransactionFilterRegister register = 1;
+    TransactionFilterUnregister unregister = 2;
+    Ping ping = 3;
+  }
+}
+
+message TransactionFilterRegister {
+  string filter_name = 1;
+  TransactionFilter filter = 2;
+}
+
+message TransactionFilterUnregister {
+  string filter_name = 1;
+}
+
+message TransactionFilter {
+  repeated string account_include = 1;
+  repeated string account_exclude = 2;
+  repeated string account_required = 3;
+}
+
+message SubscribeTransactionsResponse {
+  oneof response {
+    TransactionUpdate transaction = 1;
+    FilterResult filter_result = 2;
+    Pong pong = 3;
+    ErrorResponse error = 4;
+  }
+  uint64 sequence = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+message TransactionUpdate {
+  bytes signature = 1;
+  repeated bytes account_keys = 2;
+  repeated CompiledInstruction instructions = 3;
+  repeated MessageAddressTableLookup address_table_lookups = 4;
+  bytes fee_payer = 5;
+  uint64 slot = 6;
+  repeated string filters = 7;
+}
+
+message FilterResult {
+  string filter_name = 1;
+  bool accepted = 2;
+  optional string reason = 3;
+}
+
+message CompiledInstruction {
+  uint32 program_id_index = 1;
+  bytes accounts = 2;
+  bytes data = 3;
+}
+
+message MessageAddressTableLookup {
+  bytes account_key = 1;
+  bytes writable_indexes = 2;
+  bytes readonly_indexes = 3;
+}
+
+// Slots
+
+message SubscribeSlotsRequest {
+  bool include_leader = 1;
+}
+
+message SubscribeSlotsResponse {
+  uint64 slot = 1;
+  SlotStatus status = 2;
+  optional string leader = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+enum SlotStatus {
+  ALIVE = 0;
+  DEAD = 1;
+  COMPLETE = 2;
+}
+
+// Common
+
+message Ping {
+  int32 id = 1;
+}
+
+message Pong {
+  int32 id = 1;
+}
+
+message Heartbeat {
+  uint64 slot = 1;
+  google.protobuf.Timestamp timestamp = 2;
+}
+
+message ErrorResponse {
+  int32 code = 1;
+  string message = 2;
+  optional uint64 retry_after_ms = 3;
+}

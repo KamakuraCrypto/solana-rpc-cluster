@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package arpc.legacy;
+
+import "google/protobuf/timestamp.proto";
+
+service ARPCService {
+  rpc Subscribe(stream SubscribeRequest) returns (stream SubscribeResponse) {}
+}
+
+message SubscribeRequest {
+  map<string, SubscribeRequestFilterTransactions> transactions = 1;
+  optional int32 ping_id = 2;
+  optional bool new_seen_slots = 3;
+}
+
+message SubscribeRequestFilterTransactions {
+  repeated string account_include = 1;
+  repeated string account_exclude = 2;
+  repeated string account_required = 3;
+}
+
+message SubscribeResponse {
+  optional SubscribeResponseTransaction transaction = 1;
+  optional int32 pong_id = 2;
+  optional uint64 new_slot = 3;
+  repeated string filters = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message SubscribeResponseTransaction {
+  bytes signature = 1;
+  repeated bytes account_keys = 2;
+  repeated CompiledInstruction instructions = 3;
+  repeated MessageAddressTableLookup address_table_lookups = 4;
+}
+
+message CompiledInstruction {
+  uint32 program_id_index = 1;
+  bytes accounts = 2;
+  bytes data = 3;
+}
+
+message MessageAddressTableLookup {
+  bytes account_key = 1;
+  bytes writable_indexes = 2;
+  bytes readonly_indexes = 3;
+}
