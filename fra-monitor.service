@@ -1,0 +1,16 @@
+[Unit]
+Description=Fra (Frankfurt) gRPC Upstream Recovery Monitor
+After=corvus-proxy.service
+Wants=corvus-proxy.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/fra-monitor
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

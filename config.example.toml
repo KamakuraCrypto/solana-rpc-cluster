@@ -106,10 +106,10 @@ default_burst_tps = 5
 # client_channel_capacity = 4096
 # max_lag_events = 3
 # keepalive_interval_secs = 20
-# keepalive_timeout_secs = 10
+# keepalive_timeout_secs = 5
 # multi_region_enabled = true          # stream from all gRPC regions in parallel
-# dedup_window_secs = 30               # how long to remember messages for dedup
-# dedup_eviction_interval_secs = 5
+# dedup_window_secs = 2               # how long to remember messages for dedup
+# dedup_eviction_interval_secs = 1
 
 # ─── CPU Pinning (optional) ─────────────────────────────────
 
