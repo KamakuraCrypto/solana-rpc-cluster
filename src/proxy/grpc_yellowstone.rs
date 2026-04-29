@@ -338,54 +338,54 @@ impl Geyser for YellowstoneProxy {
     }
 
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PongResponse>, Status> {
-        let (mut upstream, x_token) = self.get_upstream().await?;
-        let req = self.inject_token(request, &x_token);
-        upstream.ping(req).await
+        let (mut upstream, _) = self.get_upstream().await?;
+        
+        upstream.ping(request).await
     }
 
     async fn get_latest_blockhash(
         &self,
         request: Request<GetLatestBlockhashRequest>,
     ) -> Result<Response<GetLatestBlockhashResponse>, Status> {
-        let (mut upstream, x_token) = self.get_upstream().await?;
-        let req = self.inject_token(request, &x_token);
-        upstream.get_latest_blockhash(req).await
+        let (mut upstream, _) = self.get_upstream().await?;
+        
+        upstream.get_latest_blockhash(request).await
     }
 
     async fn get_block_height(
         &self,
         request: Request<GetBlockHeightRequest>,
     ) -> Result<Response<GetBlockHeightResponse>, Status> {
-        let (mut upstream, x_token) = self.get_upstream().await?;
-        let req = self.inject_token(request, &x_token);
-        upstream.get_block_height(req).await
+        let (mut upstream, _) = self.get_upstream().await?;
+        
+        upstream.get_block_height(request).await
     }
 
     async fn get_slot(
         &self,
         request: Request<GetSlotRequest>,
     ) -> Result<Response<GetSlotResponse>, Status> {
-        let (mut upstream, x_token) = self.get_upstream().await?;
-        let req = self.inject_token(request, &x_token);
-        upstream.get_slot(req).await
+        let (mut upstream, _) = self.get_upstream().await?;
+        
+        upstream.get_slot(request).await
     }
 
     async fn is_blockhash_valid(
         &self,
         request: Request<IsBlockhashValidRequest>,
     ) -> Result<Response<IsBlockhashValidResponse>, Status> {
-        let (mut upstream, x_token) = self.get_upstream().await?;
-        let req = self.inject_token(request, &x_token);
-        upstream.is_blockhash_valid(req).await
+        let (mut upstream, _) = self.get_upstream().await?;
+        
+        upstream.is_blockhash_valid(request).await
     }
 
     async fn get_version(
         &self,
         request: Request<GetVersionRequest>,
     ) -> Result<Response<GetVersionResponse>, Status> {
-        let (mut upstream, x_token) = self.get_upstream().await?;
-        let req = self.inject_token(request, &x_token);
-        upstream.get_version(req).await
+        let (mut upstream, _) = self.get_upstream().await?;
+        
+        upstream.get_version(request).await
     }
 }
 

@@ -2,7 +2,7 @@ use super::DashboardState;
 use crate::config::{ApiKeyEntry, WhitelistEntry};
 use crate::middleware::api_keys::{generate_api_key, ApiKeyData};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -427,12 +427,6 @@ pub async fn health_check(
 // WebSocket Live Stats
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Deserialize)]
-pub struct WsAuthQuery {
-    pub user: Option<String>,
-    pub pass: Option<String>,
-}
-
 #[derive(Serialize)]
 struct WsStatsMessage {
     global: crate::stats::GlobalStatsSnapshot,
@@ -445,18 +439,9 @@ struct WsStatsMessage {
 pub async fn ws_stats(
     State(state): State<DashboardState>,
     headers: HeaderMap,
-    Query(query): Query<WsAuthQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Try Basic Auth header first (browser sends it on WS upgrade)
     let authed = super::check_basic_auth(&headers, &state.dashboard_user, &state.dashboard_pass).is_ok();
-
-    // Fallback to query params
-    let authed = authed || {
-        let user = query.user.unwrap_or_default();
-        let pass = query.pass.unwrap_or_default();
-        user == state.dashboard_user && pass == state.dashboard_pass
-    };
 
     if !authed {
         return StatusCode::UNAUTHORIZED.into_response();

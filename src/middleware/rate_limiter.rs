@@ -5,6 +5,8 @@ use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+const MAX_IP_LIMITERS: usize = 50_000;
+
 type Limiter = GovRateLimiter<
     governor::state::NotKeyed,
     governor::state::InMemoryState,
@@ -68,6 +70,9 @@ impl RateLimiterMiddleware {
     }
 
     pub fn check(&self, ip: &IpAddr, is_send_tx: bool) -> Result<(), bool> {
+        if !self.ip_limiters.contains_key(ip) && self.ip_limiters.len() >= MAX_IP_LIMITERS {
+            return Err(false);
+        }
         let limiters = self.get_or_create_limiters(ip);
         if limiters.rps.check().is_err() {
             return Err(false);
@@ -79,6 +84,9 @@ impl RateLimiterMiddleware {
     }
 
     pub fn check_rps(&self, ip: &IpAddr) -> Result<(), ()> {
+        if !self.ip_limiters.contains_key(ip) && self.ip_limiters.len() >= MAX_IP_LIMITERS {
+            return Err(());
+        }
         let limiters = self.get_or_create_limiters(ip);
         limiters.rps.check().map_err(|_| ())
     }

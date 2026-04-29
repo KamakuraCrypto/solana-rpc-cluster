@@ -1,0 +1,17 @@
+[Unit]
+Description=Solana RPC Cluster Node Monitor (Discord Alerts)
+After=solana-rpc-cluster.service
+Wants=solana-rpc-cluster.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/node-monitor.env
+ExecStart=/usr/local/bin/node-monitor
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
