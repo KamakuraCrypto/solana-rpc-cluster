@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# corvus-monitor: multi-region gRPC upstream monitor with Discord webhook alerts
+# Requires: DISCORD_WEBHOOK env var  (set via /etc/corvus-monitor.env → systemd EnvironmentFile)
+
+LOG=/var/log/corvus-monitor.log
+REGIONS=(fra ams lon tyo nyc)
+INSTABILITY_WINDOW=600     # seconds: window for flip counting
+INSTABILITY_THRESHOLD=4    # flips in window triggers instability alert
+INSTABILITY_COOLDOWN=1800  # min seconds between instability alerts per region
+
+declare -A state down_since last_notify instab_notify flip_log
+
+for r in "${REGIONS[@]}"; do
+    state["$r"]=unknown  down_since["$r"]=0
+    last_notify["$r"]=0  instab_notify["$r"]=0  flip_log["$r"]=""
+done
+
+log()   { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG"; }
+flag()  { case $1 in fra) echo 🇩🇪;; ams) echo 🇳🇱;; lon) echo 🇬🇧;; tyo) echo 🇯🇵;; nyc) echo 🇺🇸;; *) echo 🌐;; esac; }
+label() { case $1 in fra) echo Frankfurt;; ams) echo Amsterdam;; lon) echo London;; tyo) echo Tokyo;; nyc) echo "New York";; *) echo "$1";; esac; }
+
+fmt_dur() {
+    local s=$1
+    if   (( s < 60 ));   then echo "${s}s"
+    elif (( s < 3600 )); then echo "$((s/60))m $((s%60))s"
+    else                      echo "$((s/3600))h $(( (s%3600)/60 ))m"
+    fi
+}
+
+net_status() {
+    for r in "${REGIONS[@]}"; do
+        case "${state[$r]}" in
+            up)   printf '🟢 %s\n' "$(label "$r")" ;;
+            down) printf '🔴 %s\n' "$(label "$r")" ;;
+            *)    printf '⚪ %s\n' "$(label "$r")" ;;
+        esac
+    done
+}
+
+discord() {
+    local color=$1 title=$2 desc=$3
+    [[ -z "${DISCORD_WEBHOOK:-}" ]] && { log "WARN: DISCORD_WEBHOOK not set"; return; }
+    local payload code status_text
+    status_text=$(net_status)
+    payload=$(python3 - "$title" "$color" "$desc" "$status_text" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
+import json, sys
+title, color, desc, status, ts = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+print(json.dumps({"embeds": [{
+    "title": title, "color": color, "description": desc,
+    "fields": [{"name": "Network", "value": status, "inline": False}],
+    "footer": {"text": "corvus-proxy"}, "timestamp": ts
+}]}))
+PY
+)
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$DISCORD_WEBHOOK" \
+        -H 'Content-Type: application/json' -d "$payload")
+    [[ "$code" == "204" ]] && log "DISCORD OK: $title" || log "DISCORD ERR($code): $title"
+}
+
+add_flip() {
+    local r=$1 now=$2 cutoff=$((now - INSTABILITY_WINDOW)) kept=""
+    for ts in ${flip_log["$r"]}; do (( ts > cutoff )) && kept+="$ts "; done
+    flip_log["$r"]="${kept}${now} "
+}
+
+flip_count() {
+    local r=$1 now=$2 cutoff=$((now - INSTABILITY_WINDOW)) n=0
+    for ts in ${flip_log["$r"]}; do (( ts > cutoff )) && (( n++ )); done
+    echo "$n"
+}
+
+check_instability() {
+    local r=$1 now=$2
+    local fc; fc=$(flip_count "$r" "$now")
+    if (( fc >= INSTABILITY_THRESHOLD && now - instab_notify["$r"] > INSTABILITY_COOLDOWN )); then
+        discord 16746256 "⚠️ $(label "$r") is unstable" \
+            "Flipped **${fc}× in the last 10 min**. Upstream may be flapping."
+        instab_notify["$r"]=$now
+    fi
+}
+
+on_up() {
+    local r=$1 now=$2 old=${state["$1"]}
+    state["$r"]=up
+    [[ "$old" == up || "$old" == unknown ]] && return
+    add_flip "$r" "$now"
+    local dur; dur=$(fmt_dur $(( now - down_since["$r"] )))
+    discord 3066993 "$(flag "$r") $(label "$r") is back UP" \
+        "Recovered after **${dur}** of downtime."
+    check_instability "$r" "$now"
+}
+
+on_down() {
+    local r=$1 now=$2 err=$3 old=${state["$1"]}
+    state["$r"]=down; down_since["$r"]=$now
+    [[ "$old" == down || "$old" == unknown ]] && return
+    add_flip "$r" "$now"
+    err=$(printf '%s' "$err" | cut -c1-120)
+    local desc; desc="Upstream unreachable."$'\n\n'"\`\`\`${err}\`\`\`"
+    discord 15158332 "$(flag "$r") $(label "$r") is DOWN" "$desc"
+}
+
+log "corvus-monitor started — watching ${REGIONS[*]}"
+discord 8421504 "🚀 Corvus Monitor started" \
+    "Watching all **5 upstreams**: fra 🇩🇪 · ams 🇳🇱 · lon 🇬🇧 · tyo 🇯🇵 · nyc 🇺🇸"
+
+while IFS= read -r line; do
+    r=$(printf '%s' "$line" | grep -oP '(?<=mux\[)\w+(?=\])')
+    [[ -z "$r" ]] && continue
+    now=$(date +%s)
+    if printf '%s' "$line" | grep -q 'upstream stream established'; then
+        on_up "$r" "$now"
+    elif printf '%s' "$line" | grep -q 'upstream error'; then
+        err=$(printf '%s' "$line" | grep -oP '(?<=message: ")[^"]*' || true)
+        on_down "$r" "$now" "${err:-upstream unreachable}"
+    fi
+done < <(journalctl -u corvus-proxy.service -f --output=cat -n 0 2>/dev/null)
