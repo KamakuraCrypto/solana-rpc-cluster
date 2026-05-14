@@ -21,8 +21,13 @@ impl ManagedChannel {
         let endpoint = Channel::from_shared(url.to_string())
             .map_err(|e| format!("Invalid gRPC URL for {}: {}", node_id, e))?
             .tcp_nodelay(true)
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_timeout(Duration::from_secs(20))
+            .keep_alive_while_idle(true)
+            .initial_connection_window_size(8 * 1024 * 1024)
+            .initial_stream_window_size(4 * 1024 * 1024)
             .connect_timeout(Duration::from_secs(5));
 
         Ok(Self {
