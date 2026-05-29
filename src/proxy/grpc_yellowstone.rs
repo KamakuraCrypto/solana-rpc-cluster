@@ -5,6 +5,7 @@ use crate::middleware::ip_whitelist::IpWhitelist;
 use crate::middleware::rate_limiter::RateLimiterMiddleware;
 use crate::proxy::grpc_filter::CompiledFilters;
 use crate::proxy::grpc_mux::GrpcMultiplexer;
+use crate::proxy::subscribe_supervisor::{SupervisedStream, SupervisorBuilder};
 use crate::stats::Stats;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -67,7 +68,7 @@ impl YellowstoneProxy {
         GeyserServer::new(self)
     }
 
-    async fn get_upstream(&self) -> Result<(GeyserClient<Channel>, String), Status> {
+    async fn get_upstream(&self) -> Result<(GeyserClient<Channel>, String, String), Status> {
         let node = self
             .router
             .pick_grpc_node()
@@ -91,7 +92,7 @@ impl YellowstoneProxy {
         };
 
         let client = GeyserClient::new(channel);
-        Ok((client, x_token))
+        Ok((client, x_token, node_id))
     }
 
     fn check_access(&self, req: &Request<()>) -> Result<std::net::IpAddr, Status> {
@@ -131,39 +132,17 @@ impl YellowstoneProxy {
         mut inbound: Streaming<SubscribeRequest>,
         ip: std::net::IpAddr,
         ip_stats: Arc<crate::stats::IpStats>,
-    ) -> Result<Response<ReceiverStream<Result<SubscribeUpdate, Status>>>, Status> {
-        let (mut upstream, x_token) = self.get_upstream().await?;
-        let node_id = self
-            .router
-            .pick_grpc_node()
-            .map(|n| n.config.id.clone())
-            .unwrap_or_default();
+    ) -> Result<Response<SupervisedStream<Result<SubscribeUpdate, Status>>>, Status> {
+        let (mut upstream, x_token, node_id) = self.get_upstream().await?;
         let grpc_pool = self.grpc_pool.clone();
 
         let (upstream_tx, upstream_rx) = mpsc::channel::<SubscribeRequest>(256);
 
-        // Re-inject the consumed first message
+        // Re-inject the consumed first message.
         upstream_tx
             .send(first_msg)
             .await
             .map_err(|_| Status::internal("Channel send failed"))?;
-
-        // Forward remaining client messages to upstream
-        tokio::spawn(async move {
-            while let Some(result) = inbound.next().await {
-                match result {
-                    Ok(msg) => {
-                        if upstream_tx.send(msg).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("gRPC direct: downstream read error: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
 
         let mut upstream_req = Request::new(ReceiverStream::new(upstream_rx));
         if !x_token.is_empty() {
@@ -177,34 +156,88 @@ impl YellowstoneProxy {
 
         let (downstream_tx, downstream_rx) =
             mpsc::channel::<Result<SubscribeUpdate, Status>>(2048);
-        let ip_stats_clone = ip_stats.clone();
 
-        tokio::spawn(async move {
-            while let Some(result) = upstream_stream.next().await {
-                match &result {
-                    Err(e) => {
-                        tracing::debug!(
-                            "gRPC direct: upstream error, invalidating channel: {}",
-                            e
-                        );
-                        grpc_pool.invalidate(&node_id);
-                        let _ = downstream_tx.send(result).await;
-                        break;
-                    }
-                    Ok(_) => {
-                        if downstream_tx.send(result).await.is_err() {
+        let mut sb = SupervisorBuilder::new(
+            ip_stats.active_grpc_streams.clone(),
+            self.stats.supervisor_counters(),
+        );
+
+        // Client → upstream forwarder. Bidi gRPC allows the client to half-close the
+        // request side and keep receiving, so request EOF must NOT cancel the response
+        // side — this task just exits silently and the response forwarder lives on.
+        let token = sb.token();
+        sb.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = upstream_tx.closed() => break,
+                    item = inbound.next() => match item {
+                        Some(Ok(msg)) => {
+                            let permit = tokio::select! {
+                                biased;
+                                _ = token.cancelled() => break,
+                                _ = upstream_tx.closed() => break,
+                                p = upstream_tx.reserve() => match p {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                },
+                            };
+                            permit.send(msg);
+                        }
+                        Some(Err(e)) => {
+                            tracing::debug!("gRPC direct: downstream read error: {}", e);
                             break;
                         }
+                        None => break,
+                    },
+                }
+            }
+        });
+
+        // Forward upstream → client. Race the upstream Stream against the downstream
+        // Receiver being dropped — this is the path that previously zombied when the
+        // client disappeared during a long idle window.
+        let token = sb.token();
+        let pool_for_err = grpc_pool.clone();
+        let node_for_err = node_id.clone();
+        sb.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = downstream_tx.closed() => break,
+                    item = upstream_stream.next() => match item {
+                        Some(Ok(msg)) => {
+                            let permit = tokio::select! {
+                                biased;
+                                _ = token.cancelled() => break,
+                                _ = downstream_tx.closed() => break,
+                                p = downstream_tx.reserve() => match p {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                },
+                            };
+                            permit.send(Ok(msg));
+                        }
+                        Some(Err(e)) => {
+                            tracing::debug!(
+                                "gRPC direct: upstream error, invalidating channel: {}",
+                                e
+                            );
+                            pool_for_err.invalidate(&node_for_err);
+                            let _ = downstream_tx.send(Err(e)).await;
+                            break;
+                        }
+                        None => break,
                     }
                 }
             }
-            ip_stats_clone
-                .active_grpc_streams
-                .fetch_sub(1, Ordering::Relaxed);
         });
 
+        let handle = sb.start();
         tracing::debug!("gRPC direct: {} routed to direct upstream", ip);
-        Ok(Response::new(ReceiverStream::new(downstream_rx)))
+        Ok(Response::new(SupervisedStream::new(downstream_rx, handle)))
     }
 }
 
@@ -216,7 +249,7 @@ fn extract_client_ip<T>(req: &Request<T>) -> Result<std::net::IpAddr, Status> {
 
 #[tonic::async_trait]
 impl Geyser for YellowstoneProxy {
-    type SubscribeStream = ReceiverStream<Result<SubscribeUpdate, Status>>;
+    type SubscribeStream = SupervisedStream<Result<SubscribeUpdate, Status>>;
 
     async fn subscribe(
         &self,
@@ -238,7 +271,9 @@ impl Geyser for YellowstoneProxy {
 
         let ip_stats = self.stats.get_or_create(ip);
 
-        // Check concurrent stream limit per IP
+        // Concurrent-stream limit per IP. The supervisor owns the active counter
+        // (incremented in `start()`, decremented exactly once on drop), so we read
+        // here but do NOT touch it.
         let current_streams = ip_stats.active_grpc_streams.load(Ordering::Relaxed);
         if current_streams >= MAX_STREAMS_PER_IP {
             return Err(Status::resource_exhausted(format!(
@@ -247,7 +282,6 @@ impl Geyser for YellowstoneProxy {
             )));
         }
 
-        ip_stats.active_grpc_streams.fetch_add(1, Ordering::Relaxed);
         ip_stats
             .total_grpc_requests
             .fetch_add(1, Ordering::Relaxed);
@@ -257,18 +291,8 @@ impl Geyser for YellowstoneProxy {
         // Read the first SubscribeRequest to determine routing
         let first_msg = match inbound.next().await {
             Some(Ok(msg)) => msg,
-            Some(Err(e)) => {
-                ip_stats
-                    .active_grpc_streams
-                    .fetch_sub(1, Ordering::Relaxed);
-                return Err(Status::internal(format!("Stream error: {}", e)));
-            }
-            None => {
-                ip_stats
-                    .active_grpc_streams
-                    .fetch_sub(1, Ordering::Relaxed);
-                return Err(Status::invalid_argument("Empty subscribe stream"));
-            }
+            Some(Err(e)) => return Err(Status::internal(format!("Stream error: {}", e))),
+            None => return Err(Status::invalid_argument("Empty subscribe stream")),
         };
 
         let filters = CompiledFilters::from_request(&first_msg);
@@ -298,48 +322,65 @@ impl Geyser for YellowstoneProxy {
         // Channel for injecting pong responses back to the client
         let (pong_tx, pong_rx) = mpsc::channel::<SubscribeUpdate>(16);
 
-        let filtered_rx = self.mux.subscribe_filtered(filters, pong_rx);
+        let mut sb = SupervisorBuilder::new(
+            ip_stats.active_grpc_streams.clone(),
+            self.stats.supervisor_counters(),
+        );
+        let token = sb.token();
 
-        // Handle subsequent client messages (pings → respond with pong)
-        let ip_stats_clone = ip_stats.clone();
-        tokio::spawn(async move {
-            while let Some(result) = inbound.next().await {
-                match result {
-                    Ok(msg) => {
-                        // Client sends ping → we respond with pong
-                        if let Some(ping) = msg.ping {
-                            let pong = SubscribeUpdate {
-                                filters: vec![],
-                                created_at: None,
-                                update_oneof: Some(
-                                    subscribe_update::UpdateOneof::Pong(SubscribeUpdatePong {
-                                        id: ping.id,
-                                    }),
-                                ),
-                            };
-                            if pong_tx.send(pong).await.is_err() {
-                                break;
+        let filtered_rx = self
+            .mux
+            .subscribe_filtered(filters, pong_rx, token.clone());
+
+        // Handle subsequent client messages (pings → respond with pong).
+        // Cancel-safe: races request reads against cancellation and pong_tx.closed().
+        sb.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = pong_tx.closed() => break,
+                    item = inbound.next() => match item {
+                        Some(Ok(msg)) => {
+                            if let Some(ping) = msg.ping {
+                                let pong = SubscribeUpdate {
+                                    filters: vec![],
+                                    created_at: None,
+                                    update_oneof: Some(
+                                        subscribe_update::UpdateOneof::Pong(SubscribeUpdatePong {
+                                            id: ping.id,
+                                        }),
+                                    ),
+                                };
+                                let permit = tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => break,
+                                    _ = pong_tx.closed() => break,
+                                    p = pong_tx.reserve() => match p {
+                                        Ok(p) => p,
+                                        Err(_) => break,
+                                    },
+                                };
+                                permit.send(pong);
                             }
+                            // Filter updates in subsequent messages are ignored for now.
                         }
-                        // Filter updates in subsequent messages are ignored for now
-                    }
-                    Err(e) => {
-                        tracing::debug!("gRPC mux: client stream error: {}", e);
-                        break;
-                    }
+                        Some(Err(e)) => {
+                            tracing::debug!("gRPC mux: client stream error: {}", e);
+                            break;
+                        }
+                        None => break, // half-close on request side, response stays alive
+                    },
                 }
             }
-            ip_stats_clone
-                .active_grpc_streams
-                .fetch_sub(1, Ordering::Relaxed);
         });
 
-        Ok(Response::new(ReceiverStream::new(filtered_rx)))
+        let handle = sb.start();
+        Ok(Response::new(SupervisedStream::new(filtered_rx, handle)))
     }
 
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PongResponse>, Status> {
-        let (mut upstream, _) = self.get_upstream().await?;
-        
+        let (mut upstream, _, _) = self.get_upstream().await?;
         upstream.ping(request).await
     }
 
@@ -347,8 +388,7 @@ impl Geyser for YellowstoneProxy {
         &self,
         request: Request<GetLatestBlockhashRequest>,
     ) -> Result<Response<GetLatestBlockhashResponse>, Status> {
-        let (mut upstream, _) = self.get_upstream().await?;
-        
+        let (mut upstream, _, _) = self.get_upstream().await?;
         upstream.get_latest_blockhash(request).await
     }
 
@@ -356,8 +396,7 @@ impl Geyser for YellowstoneProxy {
         &self,
         request: Request<GetBlockHeightRequest>,
     ) -> Result<Response<GetBlockHeightResponse>, Status> {
-        let (mut upstream, _) = self.get_upstream().await?;
-        
+        let (mut upstream, _, _) = self.get_upstream().await?;
         upstream.get_block_height(request).await
     }
 
@@ -365,8 +404,7 @@ impl Geyser for YellowstoneProxy {
         &self,
         request: Request<GetSlotRequest>,
     ) -> Result<Response<GetSlotResponse>, Status> {
-        let (mut upstream, _) = self.get_upstream().await?;
-        
+        let (mut upstream, _, _) = self.get_upstream().await?;
         upstream.get_slot(request).await
     }
 
@@ -374,8 +412,7 @@ impl Geyser for YellowstoneProxy {
         &self,
         request: Request<IsBlockhashValidRequest>,
     ) -> Result<Response<IsBlockhashValidResponse>, Status> {
-        let (mut upstream, _) = self.get_upstream().await?;
-        
+        let (mut upstream, _, _) = self.get_upstream().await?;
         upstream.is_blockhash_valid(request).await
     }
 
@@ -383,8 +420,7 @@ impl Geyser for YellowstoneProxy {
         &self,
         request: Request<GetVersionRequest>,
     ) -> Result<Response<GetVersionResponse>, Status> {
-        let (mut upstream, _) = self.get_upstream().await?;
-        
+        let (mut upstream, _, _) = self.get_upstream().await?;
         upstream.get_version(request).await
     }
 }
@@ -398,9 +434,15 @@ pub async fn run_grpc_proxy(
 ) -> anyhow::Result<()> {
     tracing::info!("Yellowstone gRPC proxy listening on {}", bind_addr);
 
+    // Build the listener ourselves so we can set TCP_USER_TIMEOUT and a configurable
+    // TCP keepalive on the listening socket. Both are inherited by accepted sockets.
+    let incoming = crate::proxy::tcp_listener::build_incoming(
+        bind_addr,
+        grpc_config.tcp_keepalive_secs,
+        grpc_config.tcp_user_timeout_secs,
+    )?;
+
     tonic::transport::Server::builder()
-        .tcp_nodelay(true)
-        .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
         .initial_connection_window_size(grpc_config.connection_window_bytes)
         .initial_stream_window_size(grpc_config.stream_window_bytes)
         .http2_adaptive_window(Some(grpc_config.adaptive_window))
@@ -409,7 +451,7 @@ pub async fn run_grpc_proxy(
         .concurrency_limit_per_connection(grpc_config.concurrency_limit)
         .max_frame_size(Some(32 * 1024)) // 32KB frames
         .add_service(proxy.into_server())
-        .serve(bind_addr)
+        .serve_with_incoming(incoming)
         .await?;
 
     Ok(())

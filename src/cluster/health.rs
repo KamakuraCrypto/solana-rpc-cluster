@@ -44,6 +44,8 @@ pub struct NodeHealth {
     pub total_successes: AtomicU64,
     pub iris_healthy: AtomicBool,
     pub grpc_healthy: AtomicBool,
+    /// True when the node responds but returns -32002 Unauthorized (RPC blocked, connection OK)
+    pub rpc_blocked: AtomicBool,
     /// Multi-region mux: messages where this region delivered first (raced and won)
     pub wins: AtomicU64,
     /// Multi-region mux: messages this region delivered late (already seen)
@@ -66,6 +68,7 @@ impl NodeHealth {
             total_successes: AtomicU64::new(0),
             iris_healthy: AtomicBool::new(false),
             grpc_healthy: AtomicBool::new(true),
+            rpc_blocked: AtomicBool::new(false),
             wins: AtomicU64::new(0),
             dupes: AtomicU64::new(0),
             last_msg_ms: AtomicU64::new(0),
@@ -140,14 +143,16 @@ impl HealthChecker {
                     let timeout = Duration::from_millis(timeout_ms);
 
                     // Check RPC health + getSlot
-                    let result = tokio::time::timeout(
+                    let outcome = tokio::time::timeout(
                         timeout,
                         check_node_rpc(&node.rpc_client, &node.config.rpc_url),
                     )
-                    .await;
+                    .await
+                    .unwrap_or(RpcOutcome::Failed);
 
-                    match result {
-                        Ok(Ok((latency_ms, slot))) => {
+                    match outcome {
+                        RpcOutcome::Healthy(latency_ms, slot) => {
+                            health.rpc_blocked.store(false, Ordering::Relaxed);
                             health.record_success(latency_ms, slot);
                             if slot > max_slot {
                                 max_slot = slot;
@@ -170,7 +175,19 @@ impl HealthChecker {
                                 health.status.store(NodeStatus::Degraded as u8, Ordering::Relaxed);
                             }
                         }
-                        _ => {
+                        RpcOutcome::Blocked => {
+                            health.rpc_blocked.store(true, Ordering::Relaxed);
+                            health.record_failure();
+                            let failures = health.consecutive_failures.load(Ordering::Relaxed);
+                            if failures >= unhealthy_threshold {
+                                if health.get_status() != NodeStatus::Down {
+                                    tracing::warn!("Node {} RPC BLOCKED (auth error, {} consecutive)", health.node_id, failures);
+                                }
+                                health.status.store(NodeStatus::Down as u8, Ordering::Relaxed);
+                            }
+                        }
+                        RpcOutcome::Failed => {
+                            health.rpc_blocked.store(false, Ordering::Relaxed);
                             health.record_failure();
                             let failures = health.consecutive_failures.load(Ordering::Relaxed);
                             if failures >= unhealthy_threshold {
@@ -194,18 +211,31 @@ impl HealthChecker {
                         health.iris_healthy.store(iris_ok, Ordering::Relaxed);
                     }
 
-                    // Check gRPC health (lightweight ping)
+                    // Check gRPC health: Ping succeeds OR mux received data within 30s
                     if !node.config.grpc_url.is_empty() {
-                        let grpc_ok = tokio::time::timeout(
+                        let ping_ok = tokio::time::timeout(
                             timeout,
                             check_grpc_health(&node.config.grpc_url, &node.config.grpc_x_token),
                         )
                         .await
                         .map(|r| r.is_ok())
                         .unwrap_or(false);
+
+                        let last_msg_ms = health.last_msg_ms.load(Ordering::Relaxed);
+                        let stream_ok = if last_msg_ms > 0 {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            now_ms.saturating_sub(last_msg_ms) < 30_000
+                        } else {
+                            false
+                        };
+
+                        let grpc_ok = ping_ok || stream_ok;
                         health.grpc_healthy.store(grpc_ok, Ordering::Relaxed);
                         if !grpc_ok {
-                            tracing::debug!("Node {} gRPC health check failed", health.node_id);
+                            tracing::debug!("Node {} gRPC health check failed (ping={} stream={})", health.node_id, ping_ok, stream_ok);
                         }
                     }
                 }
@@ -231,10 +261,16 @@ impl HealthChecker {
     }
 }
 
+enum RpcOutcome {
+    Healthy(u64, u64), // (latency_ms, slot)
+    Blocked,           // -32002 Unauthorized — node reachable but RPC auth blocked
+    Failed,            // connection error, timeout, or unexpected response
+}
+
 async fn check_node_rpc(
     client: &Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
     rpc_url: &str,
-) -> anyhow::Result<(u64, u64)> {
+) -> RpcOutcome {
     let start = std::time::Instant::now();
 
     let body = serde_json::json!({
@@ -243,21 +279,45 @@ async fn check_node_rpc(
         "method": "getSlot"
     });
 
-    let uri: hyper::Uri = rpc_url.parse()?;
-    let req = hyper::Request::builder()
+    let uri: hyper::Uri = match rpc_url.parse() {
+        Ok(u) => u,
+        Err(_) => return RpcOutcome::Failed,
+    };
+    let req = match hyper::Request::builder()
         .method(hyper::Method::POST)
         .uri(uri)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))?;
+        .body(Full::new(Bytes::from(body.to_string())))
+    {
+        Ok(r) => r,
+        Err(_) => return RpcOutcome::Failed,
+    };
 
-    let resp = client.request(req).await?;
-    let resp_body = resp.into_body().collect().await?.to_bytes();
+    let resp = match client.request(req).await {
+        Ok(r) => r,
+        Err(_) => return RpcOutcome::Failed,
+    };
+    let resp_body = match resp.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return RpcOutcome::Failed,
+    };
     let latency_ms = start.elapsed().as_millis() as u64;
 
-    let json: serde_json::Value = serde_json::from_slice(&resp_body)?;
-    let slot = json["result"].as_u64().unwrap_or(0);
+    let json: serde_json::Value = match serde_json::from_slice(&resp_body) {
+        Ok(j) => j,
+        Err(_) => return RpcOutcome::Failed,
+    };
 
-    Ok((latency_ms, slot))
+    if let Some(slot) = json["result"].as_u64() {
+        return RpcOutcome::Healthy(latency_ms, slot);
+    }
+
+    // Check for -32002 Unauthorized specifically
+    if json["error"]["code"].as_i64() == Some(-32002) {
+        return RpcOutcome::Blocked;
+    }
+
+    RpcOutcome::Failed
 }
 
 async fn check_iris_health(

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Status};
 
 pub struct GrpcMultiplexer {
@@ -121,10 +122,13 @@ impl GrpcMultiplexer {
     /// Subscribe a downstream client with compiled filters.
     /// Returns a receiver that yields filtered SubscribeUpdate messages.
     /// Also takes a sender for injecting pong responses from client pings.
+    /// `cancel` lets a supervising task tear down the spawn promptly when the client
+    /// disconnects, instead of waiting for the next broadcast message to notice the dead receiver.
     pub fn subscribe_filtered(
         &self,
         filters: CompiledFilters,
         pong_rx: mpsc::Receiver<SubscribeUpdate>,
+        cancel: CancellationToken,
     ) -> mpsc::Receiver<Result<SubscribeUpdate, Status>> {
         let mut broadcast_rx = self.broadcast_tx.subscribe();
         let (tx, rx) = mpsc::channel::<Result<SubscribeUpdate, Status>>(self.client_channel_capacity);
@@ -136,6 +140,9 @@ impl GrpcMultiplexer {
 
             loop {
                 tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tx.closed() => break,
                     result = broadcast_rx.recv() => {
                         match result {
                             Ok(update) => {
@@ -145,10 +152,18 @@ impl GrpcMultiplexer {
                                     match tx.try_send(Ok(forwarded)) {
                                         Ok(()) => {}
                                         Err(mpsc::error::TrySendError::Full(msg)) => {
-                                            // Channel full — block briefly for momentary spikes
-                                            if tx.send(msg).await.is_err() {
-                                                break;
-                                            }
+                                            // Channel full — block briefly for momentary spikes.
+                                            // Use reserve() for cancel-safe send.
+                                            let permit = tokio::select! {
+                                                biased;
+                                                _ = cancel.cancelled() => break,
+                                                _ = tx.closed() => break,
+                                                p = tx.reserve() => match p {
+                                                    Ok(p) => p,
+                                                    Err(_) => break,
+                                                },
+                                            };
+                                            permit.send(msg);
                                         }
                                         Err(mpsc::error::TrySendError::Closed(_)) => {
                                             break;
@@ -180,9 +195,16 @@ impl GrpcMultiplexer {
                         }
                     }
                     Some(pong) = pong_rx.recv() => {
-                        if tx.send(Ok(pong)).await.is_err() {
-                            break;
-                        }
+                        let permit = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            _ = tx.closed() => break,
+                            p = tx.reserve() => match p {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            },
+                        };
+                        permit.send(Ok(pong));
                     }
                 }
             }

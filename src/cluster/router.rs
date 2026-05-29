@@ -114,8 +114,8 @@ impl Router {
     }
 
     /// Forward a heavy read RPC (GPA, getTokenAccountsByOwner, etc.) to a healthy
-    /// node via round-robin so expensive calls are distributed across the cluster
-    /// instead of always hitting the closest/fastest node.
+    /// node via round-robin so expensive calls are distributed across the cluster.
+    /// Falls back through remaining healthy nodes if the chosen one fails.
     pub async fn forward_heavy_rpc(
         &self,
         body: Bytes,
@@ -130,31 +130,63 @@ impl Router {
             return Err("No healthy nodes for heavy RPC".to_string());
         }
 
-        let idx = self
+        let start = self
             .heavy_rpc_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % healthy.len();
-        let node = healthy[idx];
 
-        forward_rpc_to(node, &node.config.rpc_url, body).await
+        let mut last_err = String::new();
+        for i in 0..healthy.len() {
+            let node = healthy[(start + i) % healthy.len()];
+            match forward_rpc_to(node, &node.config.rpc_url, body.clone()).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    tracing::warn!("Heavy RPC node {} failed, trying next: {}", node.config.id, e);
+                    last_err = e;
+                }
+            }
+        }
+
+        Err(last_err)
     }
 
-    /// Forward a read RPC to the best healthy node
+    /// Forward a read RPC — tries nodes in priority order, falls back on failure
     pub async fn forward_read_rpc(
         &self,
         body: Bytes,
     ) -> Result<Response<Full<Bytes>>, String> {
-        let node = self
-            .pick_read_node()
-            .ok_or_else(|| "No healthy nodes".to_string())?;
+        let mut healthy: Vec<&Arc<NodeEntry>> = self
+            .nodes
+            .iter()
+            .filter(|n| n.health.is_healthy())
+            .collect();
 
-        forward_rpc_to(&node, &node.config.rpc_url, body).await
+        if healthy.is_empty() {
+            return Err("No healthy nodes".to_string());
+        }
+
+        healthy.sort_by_key(|n| n.config.priority);
+
+        let mut last_err = String::new();
+        for node in healthy {
+            match forward_rpc_to(node, &node.config.rpc_url, body.clone()).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    tracing::warn!("Read RPC node {} failed, trying next: {}", node.config.id, e);
+                    last_err = e;
+                }
+            }
+        }
+
+        Err(last_err)
     }
 
     pub fn get_nodes(&self) -> &[Arc<NodeEntry>] {
         &self.nodes
     }
 }
+
+const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 async fn forward_rpc_to(
     node: &NodeEntry,
@@ -170,10 +202,9 @@ async fn forward_rpc_to(
         .body(Full::new(body))
         .map_err(|e| format!("Request build error: {}", e))?;
 
-    let resp = node
-        .rpc_client
-        .request(req)
+    let resp = tokio::time::timeout(UPSTREAM_TIMEOUT, node.rpc_client.request(req))
         .await
+        .map_err(|_| format!("Upstream {} timeout after 8s", node.config.id))?
         .map_err(|e| format!("Upstream {} error: {}", node.config.id, e))?;
 
     let status = resp.status();

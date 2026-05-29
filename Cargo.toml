@@ -22,6 +22,7 @@ tonic = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Dashboard
 axum = { version = "0.7", features = ["ws"] }

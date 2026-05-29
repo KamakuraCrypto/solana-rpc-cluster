@@ -11,8 +11,9 @@ use std::time::Instant;
 pub struct IpStats {
     pub active_rpc_conns: AtomicU64,
     pub active_ws_conns: AtomicU64,
-    pub active_grpc_streams: AtomicU64,
-    pub active_arpc_streams: AtomicU64,
+    // Wrapped in Arc so the supervisor can hold its own reference for clean lifecycle.
+    pub active_grpc_streams: Arc<AtomicU64>,
+    pub active_arpc_streams: Arc<AtomicU64>,
     pub total_rpc_requests: AtomicU64,
     pub total_tx_sends: AtomicU64,
     pub total_ws_messages: AtomicU64,
@@ -80,6 +81,12 @@ pub struct Stats {
     pub global_rps_current: AtomicU64,
     pub global_tps_current: AtomicU64,
     pub global_total_requests: AtomicU64,
+    // Subscribe-supervisor lifecycle metrics (gRPC + aRPC combined).
+    // `subscribe_supervisor_alive` should always equal sum of per-IP active streams;
+    // a widening gap indicates the zombie-task leak has returned.
+    pub subscribe_supervisor_alive: Arc<AtomicU64>,
+    pub subscribe_supervisor_drops_total: Arc<AtomicU64>,
+    pub forwarder_aborted_total: Arc<AtomicU64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -89,6 +96,9 @@ pub struct GlobalStatsSnapshot {
     pub global_rps: u64,
     pub global_tps: u64,
     pub connected_ips: usize,
+    pub subscribe_supervisor_alive: u64,
+    pub subscribe_supervisor_drops_total: u64,
+    pub forwarder_aborted_total: u64,
 }
 
 impl Stats {
@@ -99,6 +109,18 @@ impl Stats {
             global_rps_current: AtomicU64::new(0),
             global_tps_current: AtomicU64::new(0),
             global_total_requests: AtomicU64::new(0),
+            subscribe_supervisor_alive: Arc::new(AtomicU64::new(0)),
+            subscribe_supervisor_drops_total: Arc::new(AtomicU64::new(0)),
+            forwarder_aborted_total: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Counters shared with `SupervisorBuilder` to track subscribe lifecycle.
+    pub fn supervisor_counters(&self) -> crate::proxy::subscribe_supervisor::SupervisorCounters {
+        crate::proxy::subscribe_supervisor::SupervisorCounters {
+            active: self.subscribe_supervisor_alive.clone(),
+            drops_total: self.subscribe_supervisor_drops_total.clone(),
+            forwarder_aborted_total: self.forwarder_aborted_total.clone(),
         }
     }
 
@@ -142,6 +164,13 @@ impl Stats {
             global_rps: self.global_rps_current.load(Ordering::Relaxed),
             global_tps: self.global_tps_current.load(Ordering::Relaxed),
             connected_ips: self.per_ip.len(),
+            subscribe_supervisor_alive: self
+                .subscribe_supervisor_alive
+                .load(Ordering::Relaxed),
+            subscribe_supervisor_drops_total: self
+                .subscribe_supervisor_drops_total
+                .load(Ordering::Relaxed),
+            forwarder_aborted_total: self.forwarder_aborted_total.load(Ordering::Relaxed),
         }
     }
 

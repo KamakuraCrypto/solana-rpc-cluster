@@ -151,6 +151,19 @@ pub struct GrpcConfig {
     /// How often to evict expired dedup entries (seconds)
     #[serde(default = "default_grpc_dedup_eviction_interval_secs")]
     pub dedup_eviction_interval_secs: u64,
+    /// TCP keepalive idle time on the listener socket (seconds). 0 disables.
+    #[serde(default = "default_grpc_tcp_keepalive")]
+    pub tcp_keepalive_secs: u64,
+    /// TCP_USER_TIMEOUT (Linux) on accepted sockets, in seconds. 0 disables.
+    /// Caps unacknowledged-data time before the kernel resets the connection,
+    /// independent of TCP keepalive. The real "detect dead peer fast" knob.
+    #[serde(default = "default_grpc_tcp_user_timeout")]
+    pub tcp_user_timeout_secs: u64,
+    /// Send HTTP/2 PINGs on outbound channels even when no streams are active.
+    /// Off by default: outbound channels are pooled, idle pings risk upstream
+    /// ENHANCE_YOUR_CALM / too_many_pings.
+    #[serde(default)]
+    pub keep_alive_while_idle: bool,
 }
 
 impl Default for GrpcConfig {
@@ -168,6 +181,9 @@ impl Default for GrpcConfig {
             multi_region_enabled: default_grpc_multi_region_enabled(),
             dedup_window_secs: default_grpc_dedup_window_secs(),
             dedup_eviction_interval_secs: default_grpc_dedup_eviction_interval_secs(),
+            tcp_keepalive_secs: default_grpc_tcp_keepalive(),
+            tcp_user_timeout_secs: default_grpc_tcp_user_timeout(),
+            keep_alive_while_idle: false,
         }
     }
 }
@@ -416,3 +432,5 @@ fn default_grpc_keepalive_timeout() -> u64 { 10 }
 fn default_grpc_multi_region_enabled() -> bool { true }
 fn default_grpc_dedup_window_secs() -> u64 { 30 }
 fn default_grpc_dedup_eviction_interval_secs() -> u64 { 5 }
+fn default_grpc_tcp_keepalive() -> u64 { 60 }
+fn default_grpc_tcp_user_timeout() -> u64 { 20 }

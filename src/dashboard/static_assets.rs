@@ -26,7 +26,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   .card .value.warn { color: #ffaa00; }
   .card .value.err { color: #ff4444; }
   .node-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 20px; }
-  .node-card { background: #12121a; border: 1px solid #1e1e2e; border-radius: 8px; padding: 16px; position: relative; }
+  .node-card { background: #12121a; border: 2px solid #1e1e2e; border-radius: 8px; padding: 16px; position: relative; }
+  .node-card.healthy { border-color: #00ff88; }
+  .node-card.degraded { border-color: #ffaa00; }
+  .node-card.down { border-color: #ff4444; }
+  .node-card.rpc-blocked { border-color: #ff8800; }
   .node-card .node-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
   .node-card .node-label { font-weight: bold; font-size: 1em; }
   .node-card .node-region { font-size: 0.75em; color: #888; }
@@ -182,39 +186,63 @@ function connectWs() {
 
 function renderGlobal(g) {
   if(!g) return;
+  const bestSlot = nodesList.reduce((max, n) => n.last_slot > max ? n.last_slot : max, 0);
+  const alive = g.subscribe_supervisor_alive || 0;
+  const drops = g.subscribe_supervisor_drops_total || 0;
+  const aborts = g.forwarder_aborted_total || 0;
+  const activeSum = Object.values(ipStats).reduce((s, x) => s + (x.active_grpc_streams||0) + (x.active_arpc_streams||0), 0);
+  const drift = alive !== activeSum;
+  const driftBadge = drift ? ` <span style="color:#ff8800">⚠</span>` : '';
   document.getElementById('global-stats').innerHTML = `
     <div class="card"><div class="label">Uptime</div><div class="value">${formatUptime(g.uptime_secs)}</div></div>
+    <div class="card"><div class="label">Current Slot</div><div class="value">${bestSlot > 0 ? fmtNum(bestSlot) : '—'}</div></div>
     <div class="card"><div class="label">Total Requests</div><div class="value">${fmtNum(g.total_requests)}</div></div>
     <div class="card"><div class="label">Current RPS</div><div class="value${g.global_rps > 1000 ? ' warn' : ''}">${g.global_rps}</div></div>
     <div class="card"><div class="label">Current TPS</div><div class="value${g.global_tps > 200 ? ' warn' : ''}">${g.global_tps}</div></div>
     <div class="card"><div class="label">Connected IPs</div><div class="value">${g.connected_ips}</div></div>
+    <div class="card" title="Live supervised subscribe streams. Drift warning means lifecycle counters disagree."><div class="label">Live Streams${driftBadge}</div><div class="value${drift?' warn':''}">${alive}</div></div>
+    <div class="card" title="Total supervised streams that ended cleanly since process start."><div class="label">Stream Drops</div><div class="value">${fmtNum(drops)}</div></div>
+    <div class="card" title="Forwarder tasks that ignored cooperative cancel and had to be aborted. Should be ~0; non-zero = zombie pattern returning."><div class="label">Forwarder Aborts</div><div class="value${aborts>0?' err':''}" style="${aborts>0?'color:#ff4444':''}">${aborts}</div></div>
   `;
 }
 
 function renderNodes() {
   const grid = document.getElementById('node-grid');
   grid.innerHTML = nodesList.map(n => {
-    const statusClass = n.status === 'healthy' ? 'healthy' : n.status === 'degraded' ? 'degraded' : 'down';
+    const isBlocked = n.status === 'down' && n.rpc_blocked;
+    const statusClass = n.status === 'healthy' ? 'healthy'
+      : n.status === 'degraded' ? 'degraded'
+      : isBlocked ? 'rpc-blocked'
+      : 'down';
+    const statusColor = statusClass === 'healthy' ? '#00ff88'
+      : statusClass === 'degraded' ? '#ffaa00'
+      : statusClass === 'rpc-blocked' ? '#ff8800'
+      : '#ff4444';
+    const statusLabel = statusClass === 'rpc-blocked' ? 'RPC BLOCKED' : n.status.toUpperCase();
+    // RPC row: blocked = orange warning, healthy = green, down = red
+    const rpcColor = n.status !== 'down' ? '#00ff88' : isBlocked ? '#ff8800' : '#ff4444';
+    const rpcLabel = n.status !== 'down' ? '✓ OK' : isBlocked ? '✗ BLOCKED' : '✗ DOWN';
+    const grpcOk = n.grpc_healthy;
     const irisHtml = n.iris_configured
       ? `<div class="node-iris"><span class="status-dot ${n.iris_healthy ? 'healthy' : 'down'}"></span>${n.iris_healthy ? 'TPU OK' : 'TPU Down'}</div>`
       : '';
     const lastMsg = (n.last_msg_age_secs >= 1000000) ? '—' : `${n.last_msg_age_secs}s ago`;
     const winRate = (n.wins + n.dupes) > 0 ? ((n.wins / (n.wins + n.dupes)) * 100).toFixed(0) : '—';
-    return `<div class="node-card">
+    return `<div class="node-card ${statusClass}">
       <div class="node-header">
         <span class="status-dot ${statusClass}"></span>
         <span class="node-label">${n.label || n.id}</span>
         <span class="node-region">${n.region}</span>
       </div>
       <div class="node-stats">
-        <span class="ns-label">Status</span><span class="ns-value" style="color:${statusClass==='healthy'?'#00ff88':statusClass==='degraded'?'#ffaa00':'#ff4444'}">${n.status.toUpperCase()}</span>
-        <span class="ns-label">Latency</span><span class="ns-value">${n.latency_ms}ms</span>
-        <span class="ns-label">Slot</span><span class="ns-value">${fmtNum(n.last_slot)}</span>
+        <span class="ns-label">RPC</span><span class="ns-value" style="color:${rpcColor}">${rpcLabel}</span>
+        <span class="ns-label">gRPC</span><span class="ns-value" style="color:${grpcOk?'#00ff88':'#ff4444'}">${grpcOk?'✓ OK':'✗ DOWN'}</span>
+        <span class="ns-label">Status</span><span class="ns-value" style="color:${statusColor}">${statusLabel}</span>
+        <span class="ns-label">Latency</span><span class="ns-value">${n.latency_ms > 0 ? n.latency_ms+'ms' : '—'}</span>
+        <span class="ns-label">Slot</span><span class="ns-value">${n.last_slot > 0 ? fmtNum(n.last_slot) : '—'}</span>
         <span class="ns-label">Uptime</span><span class="ns-value">${n.uptime_pct.toFixed(1)}%</span>
-        <span class="ns-label">Wins</span><span class="ns-value" style="color:#00ff88">${fmtNum(n.wins)}</span>
-        <span class="ns-label">Dupes</span><span class="ns-value">${fmtNum(n.dupes)}</span>
-        <span class="ns-label">Win Rate</span><span class="ns-value">${winRate}${winRate!=='—'?'%':''}</span>
         <span class="ns-label">Last Msg</span><span class="ns-value">${lastMsg}</span>
+        <span class="ns-label">Win Rate</span><span class="ns-value">${winRate}${winRate!=='—'?'%':''}</span>
       </div>
       ${irisHtml}
     </div>`;
@@ -385,15 +413,15 @@ function formatUptime(s) {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-// Init: connect WS using browser's Basic Auth (sent automatically on WS upgrade)
-(function() {
-  connectWs();
-  loadApiKeys();
-})();
+async function loadNodes() {
+  try {
+    const r = await fetch('/api/nodes');
+    if(r.ok) { nodesList = await r.json(); renderNodes(); }
+  } catch(e) { console.error('Failed to load nodes:', e); }
+}
 
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  // Browser sends Basic Auth header automatically on WS upgrade (same origin)
   const url = `${proto}//${location.host}/api/ws`;
   ws = new WebSocket(url);
 
@@ -413,6 +441,12 @@ function connectWs() {
   ws.onclose = () => { setTimeout(connectWs, 3000); };
   ws.onerror = () => { ws.close(); };
 }
+
+(function() {
+  loadNodes();
+  loadApiKeys();
+  connectWs();
+})();
 </script>
 </body>
 </html>

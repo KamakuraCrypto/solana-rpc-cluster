@@ -3,6 +3,7 @@ use crate::cluster::router::Router;
 use crate::middleware::api_keys::ApiKeyStore;
 use crate::middleware::ip_whitelist::IpWhitelist;
 use crate::middleware::rate_limiter::RateLimiterMiddleware;
+use crate::proxy::subscribe_supervisor::{SupervisedStream, SupervisorBuilder};
 use crate::stats::Stats;
 use futures_util::StreamExt;
 use std::net::SocketAddr;
@@ -108,7 +109,7 @@ fn check_access(
 
 #[tonic::async_trait]
 impl ArpcService for ArpcV1Proxy {
-    type SubscribeStream = ReceiverStream<Result<arpc_v1_proto::SubscribeResponse, Status>>;
+    type SubscribeStream = SupervisedStream<Result<arpc_v1_proto::SubscribeResponse, Status>>;
 
     async fn subscribe(
         &self,
@@ -118,27 +119,12 @@ impl ArpcService for ArpcV1Proxy {
         check_access(ip, &self.whitelist, &self.api_key_store, &self.rate_limiter, &self.stats, request.metadata())?;
 
         let ip_stats = self.stats.get_or_create(ip);
-        ip_stats.active_arpc_streams.fetch_add(1, Ordering::Relaxed);
         ip_stats.total_arpc_requests.fetch_add(1, Ordering::Relaxed);
 
         let (mut upstream, _node_id) = self.get_upstream().await?;
         let mut inbound = request.into_inner();
 
         let (upstream_tx, upstream_rx) = mpsc::channel::<arpc_v1_proto::SubscribeRequest>(256);
-
-        tokio::spawn(async move {
-            while let Some(result) = inbound.next().await {
-                match result {
-                    Ok(msg) => {
-                        if upstream_tx.send(msg).await.is_err() { break; }
-                    }
-                    Err(e) => {
-                        tracing::debug!("aRPC v1 downstream read error: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
 
         let upstream_resp = upstream
             .subscribe(Request::new(ReceiverStream::new(upstream_rx)))
@@ -147,16 +133,74 @@ impl ArpcService for ArpcV1Proxy {
 
         let (downstream_tx, downstream_rx) =
             mpsc::channel::<Result<arpc_v1_proto::SubscribeResponse, Status>>(2048);
-        let ip_stats_clone = ip_stats.clone();
 
-        tokio::spawn(async move {
-            while let Some(result) = upstream_stream.next().await {
-                if downstream_tx.send(result).await.is_err() { break; }
+        let mut sb = SupervisorBuilder::new(
+            ip_stats.active_arpc_streams.clone(),
+            self.stats.supervisor_counters(),
+        );
+
+        let token = sb.token();
+        sb.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = upstream_tx.closed() => break,
+                    item = inbound.next() => match item {
+                        Some(Ok(msg)) => {
+                            let permit = tokio::select! {
+                                biased;
+                                _ = token.cancelled() => break,
+                                _ = upstream_tx.closed() => break,
+                                p = upstream_tx.reserve() => match p {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                },
+                            };
+                            permit.send(msg);
+                        }
+                        Some(Err(e)) => {
+                            tracing::debug!("aRPC v1 downstream read error: {}", e);
+                            break;
+                        }
+                        None => break,
+                    },
+                }
             }
-            ip_stats_clone.active_arpc_streams.fetch_sub(1, Ordering::Relaxed);
         });
 
-        Ok(Response::new(ReceiverStream::new(downstream_rx)))
+        let token = sb.token();
+        sb.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = downstream_tx.closed() => break,
+                    item = upstream_stream.next() => match item {
+                        Some(Ok(msg)) => {
+                            let permit = tokio::select! {
+                                biased;
+                                _ = token.cancelled() => break,
+                                _ = downstream_tx.closed() => break,
+                                p = downstream_tx.reserve() => match p {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                },
+                            };
+                            permit.send(Ok(msg));
+                        }
+                        Some(Err(e)) => {
+                            let _ = downstream_tx.send(Err(e)).await;
+                            break;
+                        }
+                        None => break,
+                    },
+                }
+            }
+        });
+
+        let handle = sb.start();
+        Ok(Response::new(SupervisedStream::new(downstream_rx, handle)))
     }
 }
 
@@ -205,11 +249,60 @@ impl ArpcV2Proxy {
     }
 }
 
+/// Build a supervised one-way forwarder: upstream Stream → downstream mpsc, cancel-safe.
+/// Used by aRPC v2's server-streaming methods (subscribe_entries, subscribe_slots).
+fn supervise_server_streaming<S, T>(
+    stats: &Stats,
+    ip_stats: Arc<crate::stats::IpStats>,
+    mut upstream_stream: S,
+) -> SupervisedStream<Result<T, Status>>
+where
+    S: tokio_stream::Stream<Item = Result<T, Status>> + Unpin + Send + 'static,
+    T: Send + 'static,
+{
+    let (downstream_tx, downstream_rx) = mpsc::channel::<Result<T, Status>>(2048);
+    let mut sb = SupervisorBuilder::new(
+        ip_stats.active_arpc_streams.clone(),
+        stats.supervisor_counters(),
+    );
+    let token = sb.token();
+    sb.spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => break,
+                _ = downstream_tx.closed() => break,
+                item = upstream_stream.next() => match item {
+                    Some(Ok(msg)) => {
+                        let permit = tokio::select! {
+                            biased;
+                            _ = token.cancelled() => break,
+                            _ = downstream_tx.closed() => break,
+                            p = downstream_tx.reserve() => match p {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            },
+                        };
+                        permit.send(Ok(msg));
+                    }
+                    Some(Err(e)) => {
+                        let _ = downstream_tx.send(Err(e)).await;
+                        break;
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
+    let handle = sb.start();
+    SupervisedStream::new(downstream_rx, handle)
+}
+
 #[tonic::async_trait]
 impl ArpcServiceV2 for ArpcV2Proxy {
-    type SubscribeEntriesStream = ReceiverStream<Result<arpc_v2_proto::SubscribeEntriesResponse, Status>>;
-    type SubscribeTransactionsStream = ReceiverStream<Result<arpc_v2_proto::SubscribeTransactionsResponse, Status>>;
-    type SubscribeSlotsStream = ReceiverStream<Result<arpc_v2_proto::SubscribeSlotsResponse, Status>>;
+    type SubscribeEntriesStream = SupervisedStream<Result<arpc_v2_proto::SubscribeEntriesResponse, Status>>;
+    type SubscribeTransactionsStream = SupervisedStream<Result<arpc_v2_proto::SubscribeTransactionsResponse, Status>>;
+    type SubscribeSlotsStream = SupervisedStream<Result<arpc_v2_proto::SubscribeSlotsResponse, Status>>;
 
     async fn subscribe_entries(
         &self,
@@ -219,23 +312,16 @@ impl ArpcServiceV2 for ArpcV2Proxy {
         check_access(ip, &self.whitelist, &self.api_key_store, &self.rate_limiter, &self.stats, request.metadata())?;
 
         let ip_stats = self.stats.get_or_create(ip);
-        ip_stats.active_arpc_streams.fetch_add(1, Ordering::Relaxed);
 
         let (mut upstream, _) = self.get_upstream().await?;
         let upstream_resp = upstream.subscribe_entries(request).await?;
-        let mut upstream_stream = upstream_resp.into_inner();
+        let upstream_stream = upstream_resp.into_inner();
 
-        let (tx, rx) = mpsc::channel::<Result<arpc_v2_proto::SubscribeEntriesResponse, Status>>(2048);
-        let ip_stats_clone = ip_stats.clone();
-
-        tokio::spawn(async move {
-            while let Some(result) = upstream_stream.next().await {
-                if tx.send(result).await.is_err() { break; }
-            }
-            ip_stats_clone.active_arpc_streams.fetch_sub(1, Ordering::Relaxed);
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(supervise_server_streaming(
+            &self.stats,
+            ip_stats,
+            upstream_stream,
+        )))
     }
 
     async fn subscribe_transactions(
@@ -246,38 +332,89 @@ impl ArpcServiceV2 for ArpcV2Proxy {
         check_access(ip, &self.whitelist, &self.api_key_store, &self.rate_limiter, &self.stats, request.metadata())?;
 
         let ip_stats = self.stats.get_or_create(ip);
-        ip_stats.active_arpc_streams.fetch_add(1, Ordering::Relaxed);
 
         let (mut upstream, _) = self.get_upstream().await?;
         let mut inbound = request.into_inner();
 
-        let (upstream_tx, upstream_rx) = mpsc::channel::<arpc_v2_proto::SubscribeTransactionsRequest>(256);
-
-        tokio::spawn(async move {
-            while let Some(result) = inbound.next().await {
-                match result {
-                    Ok(msg) => { if upstream_tx.send(msg).await.is_err() { break; } }
-                    Err(e) => { tracing::debug!("aRPC v2 tx downstream error: {}", e); break; }
-                }
-            }
-        });
+        let (upstream_tx, upstream_rx) =
+            mpsc::channel::<arpc_v2_proto::SubscribeTransactionsRequest>(256);
 
         let upstream_resp = upstream
             .subscribe_transactions(Request::new(ReceiverStream::new(upstream_rx)))
             .await?;
         let mut upstream_stream = upstream_resp.into_inner();
 
-        let (downstream_tx, downstream_rx) = mpsc::channel::<Result<arpc_v2_proto::SubscribeTransactionsResponse, Status>>(2048);
-        let ip_stats_clone = ip_stats.clone();
+        let (downstream_tx, downstream_rx) = mpsc::channel::<
+            Result<arpc_v2_proto::SubscribeTransactionsResponse, Status>,
+        >(2048);
 
-        tokio::spawn(async move {
-            while let Some(result) = upstream_stream.next().await {
-                if downstream_tx.send(result).await.is_err() { break; }
+        let mut sb = SupervisorBuilder::new(
+            ip_stats.active_arpc_streams.clone(),
+            self.stats.supervisor_counters(),
+        );
+
+        let token = sb.token();
+        sb.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = upstream_tx.closed() => break,
+                    item = inbound.next() => match item {
+                        Some(Ok(msg)) => {
+                            let permit = tokio::select! {
+                                biased;
+                                _ = token.cancelled() => break,
+                                _ = upstream_tx.closed() => break,
+                                p = upstream_tx.reserve() => match p {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                },
+                            };
+                            permit.send(msg);
+                        }
+                        Some(Err(e)) => {
+                            tracing::debug!("aRPC v2 tx downstream error: {}", e);
+                            break;
+                        }
+                        None => break,
+                    },
+                }
             }
-            ip_stats_clone.active_arpc_streams.fetch_sub(1, Ordering::Relaxed);
         });
 
-        Ok(Response::new(ReceiverStream::new(downstream_rx)))
+        let token = sb.token();
+        sb.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = downstream_tx.closed() => break,
+                    item = upstream_stream.next() => match item {
+                        Some(Ok(msg)) => {
+                            let permit = tokio::select! {
+                                biased;
+                                _ = token.cancelled() => break,
+                                _ = downstream_tx.closed() => break,
+                                p = downstream_tx.reserve() => match p {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                },
+                            };
+                            permit.send(Ok(msg));
+                        }
+                        Some(Err(e)) => {
+                            let _ = downstream_tx.send(Err(e)).await;
+                            break;
+                        }
+                        None => break,
+                    },
+                }
+            }
+        });
+
+        let handle = sb.start();
+        Ok(Response::new(SupervisedStream::new(downstream_rx, handle)))
     }
 
     async fn subscribe_slots(
@@ -288,23 +425,16 @@ impl ArpcServiceV2 for ArpcV2Proxy {
         check_access(ip, &self.whitelist, &self.api_key_store, &self.rate_limiter, &self.stats, request.metadata())?;
 
         let ip_stats = self.stats.get_or_create(ip);
-        ip_stats.active_arpc_streams.fetch_add(1, Ordering::Relaxed);
 
         let (mut upstream, _) = self.get_upstream().await?;
         let upstream_resp = upstream.subscribe_slots(request).await?;
-        let mut upstream_stream = upstream_resp.into_inner();
+        let upstream_stream = upstream_resp.into_inner();
 
-        let (tx, rx) = mpsc::channel::<Result<arpc_v2_proto::SubscribeSlotsResponse, Status>>(2048);
-        let ip_stats_clone = ip_stats.clone();
-
-        tokio::spawn(async move {
-            while let Some(result) = upstream_stream.next().await {
-                if tx.send(result).await.is_err() { break; }
-            }
-            ip_stats_clone.active_arpc_streams.fetch_sub(1, Ordering::Relaxed);
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(supervise_server_streaming(
+            &self.stats,
+            ip_stats,
+            upstream_stream,
+        )))
     }
 }
 
@@ -316,9 +446,13 @@ pub async fn run_arpc_proxy(
 ) -> anyhow::Result<()> {
     tracing::info!("aRPC proxy (v1 + v2) listening on {}", bind_addr);
 
+    let incoming = crate::proxy::tcp_listener::build_incoming(
+        bind_addr,
+        grpc_config.tcp_keepalive_secs,
+        grpc_config.tcp_user_timeout_secs,
+    )?;
+
     tonic::transport::Server::builder()
-        .tcp_nodelay(true)
-        .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
         .initial_connection_window_size(grpc_config.connection_window_bytes)
         .initial_stream_window_size(grpc_config.stream_window_bytes)
         .http2_adaptive_window(Some(grpc_config.adaptive_window))
@@ -328,7 +462,7 @@ pub async fn run_arpc_proxy(
         .max_frame_size(Some(32 * 1024)) // 32KB frames
         .add_service(ArpcServiceServer::new(v1_proxy))
         .add_service(ArpcServiceV2Server::new(v2_proxy))
-        .serve(bind_addr)
+        .serve_with_incoming(incoming)
         .await?;
 
     Ok(())
