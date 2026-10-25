@@ -52,6 +52,7 @@ fn build_request(account_pubkeys: &[String]) -> SubscribeRequest {
             owner: vec![],
             filters: vec![],
             nonempty_txn_signature: None,
+            cuckoo_accounts_filter: None,
         },
     );
 
@@ -79,6 +80,7 @@ fn build_request(account_pubkeys: &[String]) -> SubscribeRequest {
         accounts_data_slice: vec![],
         ping: None,
         from_slot: None,
+        block_footer: Default::default(),
     }
 }
 

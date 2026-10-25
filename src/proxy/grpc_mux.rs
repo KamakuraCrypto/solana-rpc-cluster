@@ -227,8 +227,11 @@ enum DedupKey {
     Transaction(Vec<u8>),
     TransactionStatus(Vec<u8>),
     Slot(u64, i32),
-    BlockMeta(u64),
-    Entry(u64, u64),
+    // Alpenglow can produce competing candidate blocks per slot. bank_id is node-local,
+    // so cross-region keys use consensus-global hashes to tell candidates apart.
+    BlockMeta(u64, String),
+    Entry(u64, u64, Vec<u8>),
+    BlockFooter(u64, Vec<u8>),
 }
 
 struct DedupCache {
@@ -290,9 +293,10 @@ fn compute_dedup_key(update: &SubscribeUpdate) -> Option<DedupKey> {
             Some(DedupKey::TransactionStatus(s.signature.clone()))
         }
         UpdateOneof::Slot(s) => Some(DedupKey::Slot(s.slot, s.status)),
-        UpdateOneof::BlockMeta(b) => Some(DedupKey::BlockMeta(b.slot)),
-        UpdateOneof::Entry(e) => Some(DedupKey::Entry(e.slot, e.index)),
-        _ => None, // Ping/Pong/Account/Block — pass through unchecked
+        UpdateOneof::BlockMeta(b) => Some(DedupKey::BlockMeta(b.slot, b.blockhash.clone())),
+        UpdateOneof::Entry(e) => Some(DedupKey::Entry(e.slot, e.index, e.hash.clone())),
+        UpdateOneof::BlockFooter(f) => Some(DedupKey::BlockFooter(f.slot, f.bank_hash.clone())),
+        _ => None, // Ping/Pong/Account/Block/EntryUpdateParent — pass through unchecked
     }
 }
 
@@ -661,6 +665,8 @@ fn build_mux_subscribe_request() -> SubscribeRequest {
             account_include: vec![],
             account_exclude: vec![],
             account_required: vec![],
+            cuckoo_account_include: None,
+            token_accounts: None,
         },
     );
 
@@ -680,7 +686,20 @@ fn build_mux_subscribe_request() -> SubscribeRequest {
     );
 
     let mut entry = HashMap::new();
-    entry.insert("mux_entry".to_string(), SubscribeRequestFilterEntry {});
+    entry.insert(
+        "mux_entry".to_string(),
+        SubscribeRequestFilterEntry {
+            include_update_parent: None,
+        },
+    );
+
+    let mut block_footer = HashMap::new();
+    block_footer.insert(
+        "mux_block_footer".to_string(),
+        SubscribeRequestFilterBlockFooter {
+            include_certificates: None,
+        },
+    );
 
     SubscribeRequest {
         accounts: HashMap::new(),
@@ -694,5 +713,42 @@ fn build_mux_subscribe_request() -> SubscribeRequest {
         accounts_data_slice: vec![],
         ping: None,
         from_slot: None,
+        block_footer,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(slot: u64, blockhash: &str, bank_id: u64) -> SubscribeUpdate {
+        SubscribeUpdate {
+            filters: vec![],
+            created_at: None,
+            update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                slot,
+                blockhash: blockhash.to_string(),
+                bank_id,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn dedup_keeps_competing_candidates_apart() {
+        // Two candidate blocks in the same slot must both pass the dedup.
+        assert_ne!(
+            compute_dedup_key(&meta(10, "candA", 1)),
+            compute_dedup_key(&meta(10, "candB", 2)),
+        );
+    }
+
+    #[test]
+    fn dedup_ignores_node_local_bank_id() {
+        // Same block seen via two regions (different node-local bank_id) is one key.
+        assert_eq!(
+            compute_dedup_key(&meta(10, "candA", 1)),
+            compute_dedup_key(&meta(10, "candA", 77)),
+        );
     }
 }

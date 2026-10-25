@@ -379,6 +379,32 @@ impl Geyser for YellowstoneProxy {
         Ok(Response::new(SupervisedStream::new(filtered_rx, handle)))
     }
 
+    type SubscribeDeshredStream = ReceiverStream<Result<SubscribeUpdateDeshred, Status>>;
+
+    async fn subscribe_deshred(
+        &self,
+        _request: Request<Streaming<SubscribeDeshredRequest>>,
+    ) -> Result<Response<Self::SubscribeDeshredStream>, Status> {
+        Err(Status::unimplemented("SubscribeDeshred is not supported by this proxy"))
+    }
+
+    type SubscribeGossipStream = ReceiverStream<Result<SubscribeUpdateGossip, Status>>;
+
+    async fn subscribe_gossip(
+        &self,
+        _request: Request<SubscribeGossipRequest>,
+    ) -> Result<Response<Self::SubscribeGossipStream>, Status> {
+        Err(Status::unimplemented("SubscribeGossip is not supported by this proxy"))
+    }
+
+    async fn subscribe_replay_info(
+        &self,
+        request: Request<SubscribeReplayInfoRequest>,
+    ) -> Result<Response<SubscribeReplayInfoResponse>, Status> {
+        let (mut upstream, _, _) = self.get_upstream().await?;
+        upstream.subscribe_replay_info(request).await
+    }
+
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PongResponse>, Status> {
         let (mut upstream, _, _) = self.get_upstream().await?;
         upstream.ping(request).await
