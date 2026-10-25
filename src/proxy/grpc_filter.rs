@@ -10,10 +10,14 @@ pub struct CompiledFilters {
     pub slots: HashMap<String, CompiledSlotFilter>,
     pub blocks_meta: Vec<String>,
     pub entry: Vec<String>,
+    pub block_footer: Vec<String>,
     // Types that require direct upstream connection (not served by mux)
     pub has_accounts: bool,
     pub has_blocks: bool,
     pub has_transactions_status: bool,
+    /// Filter options the mux can't evaluate (cuckoo filters, token-account expansion,
+    /// entry parent updates, footer certificates) — served by a direct upstream stream.
+    pub has_unsupported_options: bool,
 }
 
 pub struct CompiledTxFilter {
@@ -72,22 +76,36 @@ impl CompiledFilters {
 
         let blocks_meta = req.blocks_meta.keys().cloned().collect();
         let entry = req.entry.keys().cloned().collect();
+        let block_footer = req.block_footer.keys().cloned().collect();
+
+        let has_unsupported_options = req.transactions.values().any(|f| {
+            f.cuckoo_account_include.is_some() || f.token_accounts.is_some()
+        }) || req.entry.values().any(|f| f.include_update_parent == Some(true))
+            || req
+                .block_footer
+                .values()
+                .any(|f| f.include_certificates == Some(true));
 
         Self {
             transactions,
             slots,
             blocks_meta,
             entry,
+            block_footer,
             has_accounts: !req.accounts.is_empty(),
             has_blocks: !req.blocks.is_empty(),
             has_transactions_status: !req.transactions_status.is_empty(),
+            has_unsupported_options,
         }
     }
 
     /// Returns true if this subscription requires a direct upstream connection
     /// (contains filter types the mux doesn't serve).
     pub fn needs_direct_connection(&self) -> bool {
-        self.has_accounts || self.has_blocks || self.has_transactions_status
+        self.has_accounts
+            || self.has_blocks
+            || self.has_transactions_status
+            || self.has_unsupported_options
     }
 
     /// Returns true if these filters subscribe to anything the mux can serve.
@@ -96,6 +114,7 @@ impl CompiledFilters {
             || !self.slots.is_empty()
             || !self.blocks_meta.is_empty()
             || !self.entry.is_empty()
+            || !self.block_footer.is_empty()
     }
 
     /// Match a SubscribeUpdate against these filters.
@@ -124,6 +143,13 @@ impl CompiledFilters {
                     None
                 } else {
                     Some(self.entry.clone())
+                }
+            }
+            UpdateOneof::BlockFooter(_) => {
+                if self.block_footer.is_empty() {
+                    None
+                } else {
+                    Some(self.block_footer.clone())
                 }
             }
             UpdateOneof::Ping(_) | UpdateOneof::Pong(_) => Some(vec![]),
@@ -238,4 +264,43 @@ fn matches_tx_filter(
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_footer_metadata_is_served_by_mux() {
+        let mut req = SubscribeRequest::default();
+        req.block_footer
+            .insert("f".to_string(), SubscribeRequestFilterBlockFooter::default());
+        let f = CompiledFilters::from_request(&req);
+        assert!(f.has_mux_subscriptions());
+        assert!(!f.needs_direct_connection());
+    }
+
+    #[test]
+    fn footer_certificates_route_direct() {
+        let mut req = SubscribeRequest::default();
+        req.block_footer.insert(
+            "f".to_string(),
+            SubscribeRequestFilterBlockFooter {
+                include_certificates: Some(true),
+            },
+        );
+        assert!(CompiledFilters::from_request(&req).needs_direct_connection());
+    }
+
+    #[test]
+    fn entry_parent_updates_route_direct() {
+        let mut req = SubscribeRequest::default();
+        req.entry.insert(
+            "e".to_string(),
+            SubscribeRequestFilterEntry {
+                include_update_parent: Some(true),
+            },
+        );
+        assert!(CompiledFilters::from_request(&req).needs_direct_connection());
+    }
 }
