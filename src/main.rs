@@ -47,14 +47,20 @@ fn main() {
 
     runtime.block_on(async move {
         // Initialize tracing
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| config.general.log_level.parse().unwrap_or_default()),
-            )
-            .init();
+        // The configured log level is always the baseline; RUST_LOG only ADDS
+        // per-module directives on top of it. (A bare RUST_LOG used to silence every
+        // module it did not mention, which hid all gRPC logs in production.)
+        let filter_spec = match std::env::var("RUST_LOG") {
+            Ok(extra) if !extra.trim().is_empty() => {
+                format!("{},{}", config.general.log_level, extra)
+            }
+            _ => config.general.log_level.clone(),
+        };
+        let env_filter = tracing_subscriber::EnvFilter::try_new(&filter_spec)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-        tracing::info!("Solana RPC Cluster starting...");
+        tracing::info!("Solana RPC Cluster starting... (log filter: {})", filter_spec);
 
         // Ensure data directory exists
         let data_dir = Path::new(&config.general.data_dir);
@@ -191,6 +197,7 @@ fn main() {
             api_key_store.clone(),
             rate_limiter.clone(),
             stats.clone(),
+            config.grpc.replay_on_reconnect,
         );
 
         let arpc_v1 = ArpcV1Proxy::new(
@@ -290,7 +297,9 @@ fn build_runtime(config: &Config) -> tokio::runtime::Runtime {
             let idx = thread_idx.fetch_add(1, Ordering::SeqCst);
             if !core_ids.is_empty() {
                 let core = core_ids[idx % core_ids.len()];
-                if core_affinity::set_for_current(core) {
+                // This hook also fires for short-lived blocking-pool threads; only the
+                // initial worker threads are worth announcing (the rest just spam the journal).
+                if core_affinity::set_for_current(core) && idx < worker_threads {
                     eprintln!("Pinned worker thread {} to core {}", idx, core.id);
                 }
             }

@@ -63,14 +63,14 @@ impl SupervisorBuilder {
         let mut joinset = self.joinset;
 
         tokio::spawn(async move {
-            // Wait for any termination signal: handle dropped, external cancel,
-            // or all children finished on their own.
+            // Wait for a termination signal: the response stream was dropped (client
+            // gone / tonic finished the body) or an external cancel. Children finishing on
+            // their own is deliberately NOT a termination signal: a bidi gRPC client may
+            // half-close its request side and keep receiving for hours, and the request
+            // forwarder exiting must not take the response stream down with it.
             tokio::select! {
                 _ = drop_rx => {},
                 _ = token.cancelled() => {},
-                _ = async {
-                    while joinset.join_next().await.is_some() {}
-                } => {},
             }
 
             // Signal cooperative shutdown to anything still running.
