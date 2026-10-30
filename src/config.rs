@@ -133,7 +133,9 @@ pub struct GrpcConfig {
     /// Per-client channel capacity
     #[serde(default = "default_grpc_client_channel_capacity")]
     pub client_channel_capacity: usize,
-    /// Max lag events before disconnecting a slow consumer
+    /// Max lag events before disconnecting a slow consumer with DATA_LOSS.
+    /// Default 1: the first lag ends the stream so the client sees the break.
+    /// Values > 1 let a lagging client keep streaming with SILENT HOLES (dropped messages).
     #[serde(default = "default_grpc_max_lag_events")]
     pub max_lag_events: u64,
     /// HTTP/2 keepalive interval in seconds (server-side)
@@ -426,7 +428,7 @@ fn default_grpc_adaptive_window() -> bool { true }
 fn default_grpc_concurrency_limit() -> usize { 256 }
 fn default_grpc_broadcast_capacity() -> usize { 65536 }
 fn default_grpc_client_channel_capacity() -> usize { 4096 }
-fn default_grpc_max_lag_events() -> u64 { 3 }
+fn default_grpc_max_lag_events() -> u64 { 1 }
 fn default_grpc_keepalive_interval() -> u64 { 20 }
 fn default_grpc_keepalive_timeout() -> u64 { 10 }
 fn default_grpc_multi_region_enabled() -> bool { true }

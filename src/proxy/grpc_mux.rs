@@ -177,14 +177,18 @@ impl GrpcMultiplexer {
                                     "gRPC mux: downstream consumer lagged by {} messages (event {}/{})",
                                     n, lag_count, max_lag_events,
                                 );
+                                // Lagged(n) means n messages are already gone; continuing would
+                                // hand the client a stream with silent holes. With the default
+                                // max_lag_events = 1 the client gets DATA_LOSS on the first lag.
                                 if lag_count >= max_lag_events {
                                     tracing::warn!(
                                         "gRPC mux: disconnecting slow consumer after {} lag events",
                                         lag_count,
                                     );
-                                    let _ = tx.send(Err(Status::data_loss(
-                                        "Stream too slow: disconnected due to repeated message lag"
-                                    ))).await;
+                                    let _ = tx.send(Err(Status::data_loss(format!(
+                                        "Stream too slow: {} messages dropped due to consumer lag",
+                                        n,
+                                    )))).await;
                                     break;
                                 }
                             }
@@ -847,5 +851,41 @@ mod tests {
         ])
         .await;
         assert_eq!(out, vec![10, 11]);
+    }
+
+    fn ping() -> Arc<SubscribeUpdate> {
+        Arc::new(SubscribeUpdate {
+            filters: vec![],
+            created_at: None,
+            update_oneof: Some(UpdateOneof::Ping(SubscribeUpdatePing {})),
+        })
+    }
+
+    #[tokio::test]
+    async fn first_lag_ends_stream_with_data_loss() {
+        let (broadcast_tx, _) = broadcast::channel(2);
+        let mux = GrpcMultiplexer {
+            broadcast_tx,
+            upstream_slot: Arc::new(AtomicU64::new(0)),
+            messages_received: Arc::new(AtomicU64::new(0)),
+            client_channel_capacity: 16,
+            max_lag_events: crate::config::GrpcConfig::default().max_lag_events,
+            _upstream_handles: vec![],
+        };
+        let (_pong_tx, pong_rx) = mpsc::channel(1);
+        let mut rx = mux.subscribe_filtered(
+            CompiledFilters::from_request(&SubscribeRequest::default()),
+            pong_rx,
+            CancellationToken::new(),
+        );
+        // Current-thread runtime: the forwarding task has not run yet, so overflowing
+        // the capacity-2 broadcast here makes its first recv() return Lagged(3).
+        for _ in 0..5 {
+            mux.broadcast_tx.send(ping()).unwrap();
+        }
+        let first = rx.recv().await.expect("an item before the stream ends");
+        let status = first.expect_err("first lag must surface as an error, not a holey stream");
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(rx.recv().await.is_none(), "stream must end after DATA_LOSS");
     }
 }
