@@ -177,14 +177,18 @@ impl GrpcMultiplexer {
                                     "gRPC mux: downstream consumer lagged by {} messages (event {}/{})",
                                     n, lag_count, max_lag_events,
                                 );
+                                // Lagged(n) means n messages are already gone; continuing would
+                                // hand the client a stream with silent holes. With the default
+                                // max_lag_events = 1 the client gets DATA_LOSS on the first lag.
                                 if lag_count >= max_lag_events {
                                     tracing::warn!(
                                         "gRPC mux: disconnecting slow consumer after {} lag events",
                                         lag_count,
                                     );
-                                    let _ = tx.send(Err(Status::data_loss(
-                                        "Stream too slow: disconnected due to repeated message lag"
-                                    ))).await;
+                                    let _ = tx.send(Err(Status::data_loss(format!(
+                                        "Stream too slow: {} messages dropped due to consumer lag",
+                                        n,
+                                    )))).await;
                                     break;
                                 }
                             }
@@ -224,8 +228,10 @@ impl GrpcMultiplexer {
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 enum DedupKey {
-    Transaction(Vec<u8>),
-    TransactionStatus(Vec<u8>),
+    // (slot, signature): Alpenglow re-lands a tx from an abandoned slot into a later slot
+    // under the same signature; keying by signature alone would drop the re-landed copy.
+    Transaction(u64, Vec<u8>),
+    TransactionStatus(u64, Vec<u8>),
     Slot(u64, i32),
     // Alpenglow can produce competing candidate blocks per slot. bank_id is node-local,
     // so cross-region keys use consensus-global hashes to tell candidates apart.
@@ -287,10 +293,10 @@ fn compute_dedup_key(update: &SubscribeUpdate) -> Option<DedupKey> {
     match update.update_oneof.as_ref()? {
         UpdateOneof::Transaction(tx) => {
             let info = tx.transaction.as_ref()?;
-            Some(DedupKey::Transaction(info.signature.clone()))
+            Some(DedupKey::Transaction(tx.slot, info.signature.clone()))
         }
         UpdateOneof::TransactionStatus(s) => {
-            Some(DedupKey::TransactionStatus(s.signature.clone()))
+            Some(DedupKey::TransactionStatus(s.slot, s.signature.clone()))
         }
         UpdateOneof::Slot(s) => Some(DedupKey::Slot(s.slot, s.status)),
         UpdateOneof::BlockMeta(b) => Some(DedupKey::BlockMeta(b.slot, b.blockhash.clone())),
@@ -750,5 +756,136 @@ mod tests {
             compute_dedup_key(&meta(10, "candA", 1)),
             compute_dedup_key(&meta(10, "candA", 77)),
         );
+    }
+
+    fn tx(slot: u64, sig: &[u8], bank_id: u64) -> SubscribeUpdate {
+        SubscribeUpdate {
+            filters: vec![],
+            created_at: None,
+            update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                transaction: Some(SubscribeUpdateTransactionInfo {
+                    signature: sig.to_vec(),
+                    ..Default::default()
+                }),
+                slot,
+                bank_id,
+            })),
+        }
+    }
+
+    fn tx_status(slot: u64, sig: &[u8]) -> SubscribeUpdate {
+        SubscribeUpdate {
+            filters: vec![],
+            created_at: None,
+            update_oneof: Some(UpdateOneof::TransactionStatus(
+                SubscribeUpdateTransactionStatus {
+                    slot,
+                    signature: sig.to_vec(),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    /// Feed `(node, update)` pairs through the real dedup worker and return
+    /// the slots of everything it forwarded to the broadcast channel, in order.
+    async fn forwarded_slots(inputs: Vec<(&str, SubscribeUpdate)>) -> Vec<u64> {
+        let (raw_tx, raw_rx) = mpsc::channel(inputs.len().max(1));
+        let (bc_tx, mut bc_rx) = broadcast::channel(inputs.len().max(1));
+        let dedup = Arc::new(DedupCache::new(Duration::from_secs(30)));
+        for (node, u) in inputs {
+            raw_tx.send((node.to_string(), u)).await.unwrap();
+        }
+        drop(raw_tx);
+        run_dedup_worker(
+            raw_rx,
+            dedup,
+            bc_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            vec![],
+        )
+        .await;
+        let mut out = Vec::new();
+        while let Ok(u) = bc_rx.try_recv() {
+            out.push(match u.update_oneof.as_ref() {
+                Some(UpdateOneof::Transaction(t)) => t.slot,
+                Some(UpdateOneof::TransactionStatus(t)) => t.slot,
+                other => panic!("unexpected update {other:?}"),
+            });
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn same_sig_same_slot_from_two_nodes_is_forwarded_once() {
+        // Cross-region dedup: node-local bank_id differs, (slot, signature) does not.
+        let out = forwarded_slots(vec![
+            ("region-a", tx(10, b"sig1", 1)),
+            ("region-b", tx(10, b"sig1", 77)),
+        ])
+        .await;
+        assert_eq!(out, vec![10]);
+    }
+
+    #[tokio::test]
+    async fn same_sig_different_slot_is_forwarded_both_times() {
+        // Alpenglow re-land: a tx first seen in an abandoned slot lands again later
+        // under the same signature; both copies must reach the client.
+        let out = forwarded_slots(vec![
+            ("region-a", tx(10, b"sig1", 1)),
+            ("region-b", tx(10, b"sig1", 2)),
+            ("region-a", tx(13, b"sig1", 3)),
+            ("region-b", tx(13, b"sig1", 4)),
+        ])
+        .await;
+        assert_eq!(out, vec![10, 13]);
+    }
+
+    #[tokio::test]
+    async fn tx_status_dedups_by_slot_and_signature() {
+        let out = forwarded_slots(vec![
+            ("region-a", tx_status(10, b"sig1")),
+            ("region-b", tx_status(10, b"sig1")),
+            ("region-a", tx_status(11, b"sig1")),
+        ])
+        .await;
+        assert_eq!(out, vec![10, 11]);
+    }
+
+    fn ping() -> Arc<SubscribeUpdate> {
+        Arc::new(SubscribeUpdate {
+            filters: vec![],
+            created_at: None,
+            update_oneof: Some(UpdateOneof::Ping(SubscribeUpdatePing {})),
+        })
+    }
+
+    #[tokio::test]
+    async fn first_lag_ends_stream_with_data_loss() {
+        let (broadcast_tx, _) = broadcast::channel(2);
+        let mux = GrpcMultiplexer {
+            broadcast_tx,
+            upstream_slot: Arc::new(AtomicU64::new(0)),
+            messages_received: Arc::new(AtomicU64::new(0)),
+            client_channel_capacity: 16,
+            max_lag_events: crate::config::GrpcConfig::default().max_lag_events,
+            _upstream_handles: vec![],
+        };
+        let (_pong_tx, pong_rx) = mpsc::channel(1);
+        let mut rx = mux.subscribe_filtered(
+            CompiledFilters::from_request(&SubscribeRequest::default()),
+            pong_rx,
+            CancellationToken::new(),
+        );
+        // Current-thread runtime: the forwarding task has not run yet, so overflowing
+        // the capacity-2 broadcast here makes its first recv() return Lagged(3).
+        for _ in 0..5 {
+            mux.broadcast_tx.send(ping()).unwrap();
+        }
+        let first = rx.recv().await.expect("an item before the stream ends");
+        let status = first.expect_err("first lag must surface as an error, not a holey stream");
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(rx.recv().await.is_none(), "stream must end after DATA_LOSS");
     }
 }
