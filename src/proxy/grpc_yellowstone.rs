@@ -33,6 +33,9 @@ use geyser_proto::*;
 /// Max concurrent gRPC streams per IP (replaces RPS rate limiting for gRPC)
 const MAX_STREAMS_PER_IP: u64 = 500;
 
+/// Monotonic stream counter used to label streams in logs.
+static STREAM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct YellowstoneProxy {
     router: Arc<Router>,
     grpc_pool: Arc<GrpcPool>,
@@ -41,6 +44,7 @@ pub struct YellowstoneProxy {
     api_key_store: ApiKeyStore,
     rate_limiter: RateLimiterMiddleware,
     stats: Arc<Stats>,
+    replay_on_reconnect: bool,
 }
 
 impl YellowstoneProxy {
@@ -52,6 +56,7 @@ impl YellowstoneProxy {
         api_key_store: ApiKeyStore,
         rate_limiter: RateLimiterMiddleware,
         stats: Arc<Stats>,
+        replay_on_reconnect: bool,
     ) -> Self {
         Self {
             router,
@@ -61,6 +66,7 @@ impl YellowstoneProxy {
             api_key_store,
             rate_limiter,
             stats,
+            replay_on_reconnect,
         }
     }
 
@@ -124,36 +130,28 @@ impl YellowstoneProxy {
         req
     }
 
-    /// Direct upstream subscribe (1:1) — fallback for subscriptions the mux can't serve.
-    /// `first_msg` is the already-consumed first SubscribeRequest.
+    /// Direct upstream subscribe — for subscriptions the mux can't serve (accounts,
+    /// blocks, transaction status, unsupported filter options).
+    ///
+    /// The client's stream is NEVER terminated because of the upstream: an upstream
+    /// stream error/EOF triggers a transparent reconnect (to any available node), the
+    /// client's latest SubscribeRequest is re-sent, and when possible the subscription
+    /// resumes from the last seen slot so nothing is missed. The client stream only ends
+    /// when the client goes away.
     async fn subscribe_direct(
         &self,
         first_msg: SubscribeRequest,
         mut inbound: Streaming<SubscribeRequest>,
         ip: std::net::IpAddr,
         ip_stats: Arc<crate::stats::IpStats>,
+        label: String,
     ) -> Result<Response<SupervisedStream<Result<SubscribeUpdate, Status>>>, Status> {
-        let (mut upstream, x_token, node_id) = self.get_upstream().await?;
+        let router = self.router.clone();
         let grpc_pool = self.grpc_pool.clone();
+        let replay = self.replay_on_reconnect;
 
-        let (upstream_tx, upstream_rx) = mpsc::channel::<SubscribeRequest>(256);
-
-        // Re-inject the consumed first message.
-        upstream_tx
-            .send(first_msg)
-            .await
-            .map_err(|_| Status::internal("Channel send failed"))?;
-
-        let mut upstream_req = Request::new(ReceiverStream::new(upstream_rx));
-        if !x_token.is_empty() {
-            if let Ok(val) = x_token.parse() {
-                upstream_req.metadata_mut().insert("x-token", val);
-            }
-        }
-
-        let upstream_resp = upstream.subscribe(upstream_req).await?;
-        let mut upstream_stream = upstream_resp.into_inner();
-
+        // Client → manager: subsequent SubscribeRequests (filter updates, pings).
+        let (client_tx, mut client_rx) = mpsc::channel::<SubscribeRequest>(256);
         let (downstream_tx, downstream_rx) =
             mpsc::channel::<Result<SubscribeUpdate, Status>>(2048);
 
@@ -162,23 +160,24 @@ impl YellowstoneProxy {
             self.stats.supervisor_counters(),
         );
 
-        // Client → upstream forwarder. Bidi gRPC allows the client to half-close the
+        // Client → manager forwarder. Bidi gRPC allows the client to half-close the
         // request side and keep receiving, so request EOF must NOT cancel the response
-        // side — this task just exits silently and the response forwarder lives on.
+        // side — this task just exits silently and the manager lives on.
         let token = sb.token();
+        let fwd_label = label.clone();
         sb.spawn(async move {
             loop {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => break,
-                    _ = upstream_tx.closed() => break,
+                    _ = client_tx.closed() => break,
                     item = inbound.next() => match item {
                         Some(Ok(msg)) => {
                             let permit = tokio::select! {
                                 biased;
                                 _ = token.cancelled() => break,
-                                _ = upstream_tx.closed() => break,
-                                p = upstream_tx.reserve() => match p {
+                                _ = client_tx.closed() => break,
+                                p = client_tx.reserve() => match p {
                                     Ok(p) => p,
                                     Err(_) => break,
                                 },
@@ -186,59 +185,231 @@ impl YellowstoneProxy {
                             permit.send(msg);
                         }
                         Some(Err(e)) => {
-                            tracing::debug!("gRPC direct: downstream read error: {}", e);
+                            tracing::info!("gRPC direct[{}]: client request stream error: {}", fwd_label, e);
                             break;
                         }
-                        None => break,
+                        None => {
+                            tracing::debug!("gRPC direct[{}]: client half-closed request side", fwd_label);
+                            break;
+                        }
                     },
                 }
             }
         });
 
-        // Forward upstream → client. Race the upstream Stream against the downstream
-        // Receiver being dropped — this is the path that previously zombied when the
-        // client disappeared during a long idle window.
+        // Upstream manager: owns the upstream stream, reconnects forever.
         let token = sb.token();
-        let pool_for_err = grpc_pool.clone();
-        let node_for_err = node_id.clone();
+        let mgr_label = label.clone();
         sb.spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => break,
-                    _ = downstream_tx.closed() => break,
-                    item = upstream_stream.next() => match item {
-                        Some(Ok(msg)) => {
-                            let permit = tokio::select! {
-                                biased;
-                                _ = token.cancelled() => break,
-                                _ = downstream_tx.closed() => break,
-                                p = downstream_tx.reserve() => match p {
-                                    Ok(p) => p,
-                                    Err(_) => break,
-                                },
-                            };
-                            permit.send(Ok(msg));
+            let started = std::time::Instant::now();
+            let mut latest_req = first_msg;
+            let mut last_slot: u64 = 0;
+            let mut total_forwarded: u64 = 0;
+            let mut attempts: u64 = 0;
+            let mut backoff = std::time::Duration::from_secs(1);
+            // from_slot to request on the next connect (None = live)
+            let mut replay_from: Option<u64> = None;
+            let mut client_open = true;
+            let close_reason: &str;
+
+            'reconnect: loop {
+                attempts += 1;
+                let node = match router.pick_grpc_node().or_else(|| {
+                    router.get_grpc_eligible_nodes().into_iter().min_by_key(|n| n.config.priority)
+                }) {
+                    Some(n) => n,
+                    None => {
+                        tracing::error!("gRPC direct[{}]: no gRPC-eligible nodes configured", mgr_label);
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => { close_reason = "cancelled"; break 'reconnect },
+                            _ = downstream_tx.closed() => { close_reason = "client gone"; break 'reconnect },
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'reconnect,
                         }
-                        Some(Err(e)) => {
-                            tracing::debug!(
-                                "gRPC direct: upstream error, invalidating channel: {}",
-                                e
-                            );
-                            pool_for_err.invalidate(&node_for_err);
-                            let _ = downstream_tx.send(Err(e)).await;
-                            break;
-                        }
-                        None => break,
+                    }
+                };
+                let node_id = node.config.id.clone();
+
+                // Build the upstream request stream with the latest client filters.
+                let (upstream_tx, upstream_rx) = mpsc::channel::<SubscribeRequest>(256);
+                let mut req = latest_req.clone();
+                if let Some(fs) = replay_from {
+                    req.from_slot = Some(fs);
+                }
+                let _ = upstream_tx.send(req).await;
+                let mut upstream_req = Request::new(ReceiverStream::new(upstream_rx));
+                if !node.config.grpc_x_token.is_empty() {
+                    if let Ok(val) = node.config.grpc_x_token.parse() {
+                        upstream_req.metadata_mut().insert("x-token", val);
                     }
                 }
+
+                let connect = async {
+                    let channel = if let Some(managed) = grpc_pool.get_channel(&node_id) {
+                        managed.get().await?
+                    } else {
+                        Channel::from_shared(node.config.grpc_url.clone())
+                            .map_err(|e| Status::internal(format!("Invalid URL: {}", e)))?
+                            .tcp_nodelay(true)
+                            .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+                            .keep_alive_timeout(std::time::Duration::from_secs(20))
+                            .connect_timeout(std::time::Duration::from_secs(5))
+                            .connect()
+                            .await
+                            .map_err(|e| Status::unavailable(format!("Connect failed: {}", e)))?
+                    };
+                    let mut client = GeyserClient::new(channel);
+                    client.subscribe(upstream_req).await.map(|r| r.into_inner())
+                };
+
+                let mut upstream_stream = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => { close_reason = "cancelled"; break 'reconnect },
+                    _ = downstream_tx.closed() => { close_reason = "client gone"; break 'reconnect },
+                    r = connect => match r {
+                        Ok(s) => s,
+                        Err(e) => {
+                            grpc_pool.invalidate(&node_id);
+                            tracing::warn!(
+                                "gRPC direct[{}]: upstream {} subscribe failed (attempt {}): {}",
+                                mgr_label, node_id, attempts, e
+                            );
+                            // Only a rejected from_slot (not a plain connect failure)
+                            // means we must go live next time.
+                            if replay_from.is_some() && is_replay_rejection(&e) {
+                                tracing::warn!("gRPC direct[{}]: replay from {:?} rejected by upstream, resuming live", mgr_label, replay_from);
+                                replay_from = None;
+                            }
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => { close_reason = "cancelled"; break 'reconnect },
+                                _ = downstream_tx.closed() => { close_reason = "client gone"; break 'reconnect },
+                                _ = tokio::time::sleep(backoff) => {},
+                            }
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
+                            continue 'reconnect;
+                        }
+                    },
+                };
+
+                let established = std::time::Instant::now();
+                let mut stream_msgs: u64 = 0;
+                if attempts == 1 {
+                    tracing::info!("gRPC direct[{}]: upstream stream established on {}", mgr_label, node_id);
+                } else {
+                    tracing::info!(
+                        "gRPC direct[{}]: upstream stream re-established on {} (attempt {}, replay_from={:?})",
+                        mgr_label, node_id, attempts, replay_from
+                    );
+                }
+
+                let stream_err: Option<(bool, String)> = loop {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => { close_reason = "cancelled"; break 'reconnect },
+                        _ = downstream_tx.closed() => { close_reason = "client gone"; break 'reconnect },
+                        msg = client_rx.recv(), if client_open => match msg {
+                            Some(msg) => {
+                                // Pings don't change filters (Yellowstone semantics); any other
+                                // request replaces the subscription and must survive reconnects.
+                                if msg.ping.is_none() {
+                                    latest_req = msg.clone();
+                                }
+                                if upstream_tx.send(msg).await.is_err() {
+                                    break Some((false, "upstream request side closed".to_string()));
+                                }
+                            }
+                            None => {
+                                // Client forwarder gone (half-close). Keep streaming, stop
+                                // polling the request side.
+                                client_open = false;
+                            }
+                        },
+                        item = upstream_stream.next() => match item {
+                            Some(Ok(msg)) => {
+                                stream_msgs += 1;
+                                if let Some(subscribe_update::UpdateOneof::Slot(s)) = &msg.update_oneof {
+                                    if s.slot > last_slot { last_slot = s.slot; }
+                                }
+                                // Pongs from the upstream answer client pings we forwarded; pass them on.
+                                let permit = tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => { close_reason = "cancelled"; break 'reconnect },
+                                    _ = downstream_tx.closed() => { close_reason = "client gone"; break 'reconnect },
+                                    p = downstream_tx.reserve() => match p {
+                                        Ok(p) => p,
+                                        Err(_) => { close_reason = "client gone"; break 'reconnect },
+                                    },
+                                };
+                                permit.send(Ok(msg));
+                                total_forwarded += 1;
+                            }
+                            Some(Err(e)) => break Some((is_replay_rejection(&e), e.to_string())),
+                            None => break None,
+                        }
+                    }
+                };
+
+                let lived = established.elapsed();
+                grpc_pool.invalidate(&node_id);
+                match &stream_err {
+                    Some((_, e)) => tracing::warn!(
+                        "gRPC direct[{}]: upstream {} stream failed after {:?} ({} msgs): {} — reconnecting, client stream kept open",
+                        mgr_label, node_id, lived, stream_msgs, e
+                    ),
+                    None => tracing::warn!(
+                        "gRPC direct[{}]: upstream {} stream ended after {:?} ({} msgs) — reconnecting, client stream kept open",
+                        mgr_label, node_id, lived, stream_msgs
+                    ),
+                }
+
+                // Decide replay: resume from the last seen slot unless this replay attempt
+                // was rejected (explicit status, or established-then-died with no data).
+                let rejected = replay_from.is_some()
+                    && (stream_msgs == 0 || matches!(stream_err, Some((true, _))));
+                replay_from = if !replay {
+                    None
+                } else if rejected {
+                    tracing::warn!("gRPC direct[{}]: replay from {:?} rejected, resuming live", mgr_label, replay_from);
+                    None
+                } else if last_slot > 0 {
+                    Some(last_slot)
+                } else {
+                    None
+                };
+
+                if lived >= std::time::Duration::from_secs(5) {
+                    backoff = std::time::Duration::from_secs(1);
+                }
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => { close_reason = "cancelled"; break 'reconnect },
+                    _ = downstream_tx.closed() => { close_reason = "client gone"; break 'reconnect },
+                    _ = tokio::time::sleep(backoff) => {},
+                }
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
             }
+
+            tracing::info!(
+                "gRPC direct[{}]: stream closed: {} (lived {:?}, forwarded={}, upstream_attempts={}, last_slot={})",
+                mgr_label, close_reason, started.elapsed(), total_forwarded, attempts, last_slot
+            );
         });
 
         let handle = sb.start();
-        tracing::debug!("gRPC direct: {} routed to direct upstream", ip);
+        tracing::info!("gRPC direct[{}]: {} routed to direct upstream", label, ip);
         Ok(Response::new(SupervisedStream::new(downstream_rx, handle)))
     }
+}
+
+/// Does this upstream status look like a rejected `from_slot` replay (as opposed to a
+/// transport/connect failure)? Yellowstone answers an unreplayable from_slot with an
+/// argument/precondition style status, never with Unavailable.
+fn is_replay_rejection(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::InvalidArgument | tonic::Code::OutOfRange | tonic::Code::FailedPrecondition
+    ) || status.message().to_ascii_lowercase().contains("from_slot")
 }
 
 fn extract_client_ip<T>(req: &Request<T>) -> Result<std::net::IpAddr, Status> {
@@ -296,27 +467,39 @@ impl Geyser for YellowstoneProxy {
         };
 
         let filters = CompiledFilters::from_request(&first_msg);
+        let stream_no = STREAM_SEQ.fetch_add(1, Ordering::Relaxed);
+        let label = format!("{}#{}", ip, stream_no);
 
         // Route: if subscription needs types the mux doesn't serve, use direct upstream
         if filters.needs_direct_connection() || !filters.has_mux_subscriptions() {
-            tracing::debug!(
-                "gRPC subscribe from {}: routing to direct upstream (accounts={}, blocks={}, tx_status={})",
-                ip,
-                filters.has_accounts,
-                filters.has_blocks,
-                filters.has_transactions_status,
+            tracing::info!(
+                "gRPC subscribe[{}]: direct path (accounts={} blocks={} tx_status={} tx={} slots={} blocks_meta={} entry={} footer={} unsupported_opts={} from_slot={:?})",
+                label,
+                first_msg.accounts.len(),
+                first_msg.blocks.len(),
+                first_msg.transactions_status.len(),
+                filters.transactions.len(),
+                filters.slots.len(),
+                filters.blocks_meta.len(),
+                filters.entry.len(),
+                filters.block_footer.len(),
+                filters.has_unsupported_options,
+                first_msg.from_slot,
             );
             return self
-                .subscribe_direct(first_msg, inbound, ip, ip_stats)
+                .subscribe_direct(first_msg, inbound, ip, ip_stats, label)
                 .await;
         }
 
         // Mux path: subscribe to broadcast with client's filters
-        tracing::debug!(
-            "gRPC subscribe from {}: routing to mux ({} tx filters, {} slot filters)",
-            ip,
+        tracing::info!(
+            "gRPC subscribe[{}]: mux path (tx={} slots={} blocks_meta={} entry={} footer={})",
+            label,
             filters.transactions.len(),
             filters.slots.len(),
+            filters.blocks_meta.len(),
+            filters.entry.len(),
+            filters.block_footer.len(),
         );
 
         // Channel for injecting pong responses back to the client
@@ -330,7 +513,7 @@ impl Geyser for YellowstoneProxy {
 
         let filtered_rx = self
             .mux
-            .subscribe_filtered(filters, pong_rx, token.clone());
+            .subscribe_filtered(label.clone(), filters, pong_rx, token.clone());
 
         // Handle subsequent client messages (pings → respond with pong).
         // Cancel-safe: races request reads against cancellation and pong_tx.closed().
@@ -366,7 +549,7 @@ impl Geyser for YellowstoneProxy {
                             // Filter updates in subsequent messages are ignored for now.
                         }
                         Some(Err(e)) => {
-                            tracing::debug!("gRPC mux: client stream error: {}", e);
+                            tracing::info!("gRPC mux[{}]: client request stream error: {}", label, e);
                             break;
                         }
                         None => break, // half-close on request side, response stays alive

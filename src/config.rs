@@ -136,8 +136,13 @@ pub struct GrpcConfig {
     /// Max lag events before disconnecting a slow consumer with DATA_LOSS.
     /// Default 1: the first lag ends the stream so the client sees the break.
     /// Values > 1 let a lagging client keep streaming with SILENT HOLES (dropped messages).
+    /// 0 never disconnects (lag is only logged).
     #[serde(default = "default_grpc_max_lag_events")]
     pub max_lag_events: u64,
+    /// After an upstream stream drops, re-subscribe with `from_slot` set to the last
+    /// seen slot so the gap is backfilled (single-upstream mux and direct streams).
+    #[serde(default = "default_grpc_replay_on_reconnect")]
+    pub replay_on_reconnect: bool,
     /// HTTP/2 keepalive interval in seconds (server-side)
     #[serde(default = "default_grpc_keepalive_interval")]
     pub keepalive_interval_secs: u64,
@@ -178,6 +183,7 @@ impl Default for GrpcConfig {
             broadcast_capacity: default_grpc_broadcast_capacity(),
             client_channel_capacity: default_grpc_client_channel_capacity(),
             max_lag_events: default_grpc_max_lag_events(),
+            replay_on_reconnect: default_grpc_replay_on_reconnect(),
             keepalive_interval_secs: default_grpc_keepalive_interval(),
             keepalive_timeout_secs: default_grpc_keepalive_timeout(),
             multi_region_enabled: default_grpc_multi_region_enabled(),
@@ -429,10 +435,11 @@ fn default_grpc_concurrency_limit() -> usize { 256 }
 fn default_grpc_broadcast_capacity() -> usize { 65536 }
 fn default_grpc_client_channel_capacity() -> usize { 4096 }
 fn default_grpc_max_lag_events() -> u64 { 1 }
+fn default_grpc_replay_on_reconnect() -> bool { true }
 fn default_grpc_keepalive_interval() -> u64 { 20 }
 fn default_grpc_keepalive_timeout() -> u64 { 10 }
 fn default_grpc_multi_region_enabled() -> bool { true }
-fn default_grpc_dedup_window_secs() -> u64 { 30 }
+fn default_grpc_dedup_window_secs() -> u64 { 60 }
 fn default_grpc_dedup_eviction_interval_secs() -> u64 { 5 }
 fn default_grpc_tcp_keepalive() -> u64 { 60 }
 fn default_grpc_tcp_user_timeout() -> u64 { 20 }
