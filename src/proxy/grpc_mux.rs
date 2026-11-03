@@ -224,8 +224,10 @@ impl GrpcMultiplexer {
     /// `cancel` lets a supervising task tear down the spawn promptly when the client
     /// disconnects, instead of waiting for the next broadcast message to notice the dead receiver.
     ///
-    /// A slow consumer is never disconnected: if it falls behind the broadcast ring it
-    /// loses the oldest messages (logged, counted) and keeps streaming.
+    /// A slow consumer that falls behind the broadcast ring loses the oldest messages
+    /// (logged, counted). Once its lag events reach `max_lag_events` the stream is ended
+    /// with DATA_LOSS so the client sees the hole and reconnects; `max_lag_events = 0`
+    /// never disconnects and only logs.
     pub fn subscribe_filtered(
         &self,
         label: String,
